@@ -35,6 +35,128 @@ Your agent sets up each integration for you. It reads the recipe, asks for API k
 
 See [Getting Data In](docs/integrations/README.md) for the full guide and the [Skillpack](docs/GBRAIN_SKILLPACK.md) for all capabilities.
 
+## Install
+
+### With OpenClaw or Hermes Agent (recommended)
+
+Paste this block into [OpenClaw](https://openclaw.ai) or [Hermes Agent](https://github.com/NousResearch/hermes-agent). The agent will install GBrain, set up your database, import your files, and verify everything works.
+
+```
+GOAL: Install GBrain as my personal knowledge brain. When done, I should
+be able to search my own markdown files with hybrid search (keyword + vector).
+
+YOU MUST COMPLETE EVERY STEP BELOW. Do not skip steps. Do not reorder.
+Each step depends on the previous one. After each step, verify it worked
+before proceeding. If a step fails, stop and fix it. Do not continue
+past a failed step.
+
+STEP 1 — INSTALL GBRAIN
+Run these commands:
+  curl -fsSL https://bun.sh/install | bash
+  source ~/.bashrc
+  bun add github:garrytan/gbrain
+Verify: run `gbrain --version`. You must see a version number.
+If it fails: check that bun is in your PATH.
+
+STEP 2 — CONNECT DATABASE
+Run: gbrain init --supabase
+This starts a wizard. You will need the user's Supabase connection string.
+Tell the user:
+  "I need your Supabase Shared Pooler connection string. Here's how to find it:
+   1. Go to https://supabase.com and open your project
+   2. Click 'Get Connected' next to the project URL
+   3. Select 'Direct Connection String' then 'Session Pooler'
+   4. Copy the 'Shared Pooler' connection string
+   5. Paste it here"
+IMPORTANT: Do NOT ask for the anon key or project URL. Those are wrong.
+The connection string starts with postgresql:// and includes port 6543.
+Verify: run `gbrain doctor --json`. ALL checks must pass.
+If doctor fails: check the connection string, make sure pgvector extension
+exists (gbrain init creates it automatically).
+
+STEP 3 — FIND AND IMPORT MARKDOWN
+Search these directories for markdown files:
+  find ~/git ~/Documents ~/notes ~/brain -maxdepth 3 -name "*.md" 2>/dev/null | head -30
+Pick the directory with the most markdown files. Tell the user which
+directory you found and how many files it contains. Ask: "Found N markdown
+files in /path/. Import these into your brain?"
+If user confirms: run `gbrain import /path/ --no-embed`
+Verify: run `gbrain stats`. Page count must be > 0.
+
+STEP 4 — PROVE SEARCH WORKS
+Run a keyword search using content from the imported files:
+  gbrain search "a relevant term from the imported content"
+You must get at least 1 result. Show the user the result.
+If 0 results: the import failed. Run `gbrain stats` to check page count.
+
+STEP 5 — START EMBEDDINGS
+Run: gbrain embed --stale
+This generates vector embeddings for semantic search. It takes 1-2 minutes
+per 1000 pages. Tell the user: "Generating embeddings for semantic search.
+This takes about [estimated time]. Keyword search already works."
+Verify: run `gbrain stats`. Embedded count must equal chunk count.
+
+STEP 6 — PROVE HYBRID SEARCH WORKS
+Run a semantic query (meaning-based, not keyword match):
+  gbrain query "what are the key themes across these documents?"
+You must get results that show vector + keyword fusion working.
+Show the user. This is the magic moment.
+
+STEP 7 — LOAD THE SKILLPACK
+Read docs/GBRAIN_SKILLPACK.md. This is your operational playbook.
+Adopt these patterns into your behavior immediately:
+  - Brain-first lookup: ALWAYS search the brain before answering questions
+  - Entity detection: detect people, companies, concepts in every message
+  - Source attribution: cite brain pages when using brain knowledge
+  - Iron law of back-linking: every entity mention gets a back-link
+  - Compiled truth: rewrite the synthesis, never the timeline
+Read the individual guides in docs/guides/ for detailed instructions
+on each pattern.
+
+STEP 8 — SET UP LIVE SYNC
+The brain must stay current with the markdown repo. Set up sync:
+  gbrain sync --repo /path/to/brain/ && gbrain embed --stale
+Read docs/guides/live-sync.md for approach options (cron, --watch, webhook).
+Pick whichever fits your environment. Verify: edit a markdown file in the
+repo, run sync, search for the change. The updated content must appear.
+
+STEP 9 — SET UP AUTO-UPDATE
+Run: gbrain check-update --json
+Set up a daily cron or scheduled check. When new versions are available,
+tell the user what's new and ask if they want to upgrade.
+IMPORTANT: Never auto-install updates. Always ask first.
+
+STEP 10 — CHECK AVAILABLE INTEGRATIONS
+Run: gbrain integrations
+Show the user what senses (data inputs) are available. If they want
+any integration (voice-to-brain, email, etc.), run:
+  gbrain integrations show <id>
+and follow the recipe step by step.
+
+STEP 11 — VERIFY EVERYTHING
+Run the verification runbook: read docs/GBRAIN_VERIFY.md
+Execute every check. All must pass. Report results to the user.
+If any check fails, fix it before declaring setup complete.
+
+DONE. Tell the user:
+  "GBrain is set up. You have [N] pages indexed with hybrid search.
+   I will check the brain before answering questions about people,
+   companies, or topics in your knowledge base. Your brain stays
+   current via live sync. Run 'gbrain integrations' to add new
+   senses like voice calls, email, or calendar."
+```
+
+### Without an agent (standalone CLI)
+
+```bash
+bun add -g github:garrytan/gbrain
+gbrain init --supabase          # guided wizard
+gbrain import ~/git/brain/      # index your markdown
+gbrain query "what do we know about competitive dynamics?"
+```
+
+Run `gbrain --help` for all commands. See [MCP setup](docs/mcp/DEPLOY.md) for connecting Claude Desktop, Perplexity, etc.
+
 ## The Compounding Thesis
 
 Most tools help you find things. GBrain makes you smarter over time.
@@ -169,268 +291,6 @@ gbrain query "what are our biggest risks right now?"
 Your file count will be different. Your queries will be different. The agent picks them based on what it imported. That's the point: this is YOUR brain, not a demo.
 
 **The compounding effect.** Search for Pedro. The agent pulls his page, his relationship history, his company. Next time Brex comes up in conversation, the agent already knows Pedro co-founded it, what you discussed last, and what's on your open threads. You didn't do anything — the brain already had it.
-
-## Install
-
-### Prerequisites
-
-**Without Postgres**, you can use the GBrain knowledge model right now: the [skills](docs/GBRAIN_SKILLPACK.md), [schema](docs/GBRAIN_RECOMMENDED_SCHEMA.md), and compiled truth + timeline pattern work with any agent that reads and writes markdown files. Add Postgres when `grep` stops being enough.
-
-**With Postgres**, GBrain needs three things:
-
-| Dependency | What it's for | How to get it |
-|------------|--------------|---------------|
-| **Supabase account** | Postgres + pgvector database | [supabase.com](https://supabase.com) (Pro tier, $25/mo for 8GB) |
-| **OpenAI API key** | Embeddings (text-embedding-3-large) | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) |
-| **Anthropic API key** | Multi-query expansion + LLM chunking (Haiku) | [console.anthropic.com](https://console.anthropic.com) |
-
-Set the API keys as environment variables:
-
-```bash
-export OPENAI_API_KEY=sk-...
-export ANTHROPIC_API_KEY=sk-ant-...
-```
-
-The Supabase connection URL is configured during `gbrain init`. The OpenAI and Anthropic SDKs read their keys from the environment automatically.
-
-Without an OpenAI key, search still works (keyword only, no vector search). Without an Anthropic key, search still works (no multi-query expansion, no LLM chunking).
-
-### With OpenClaw or Hermes Agent (recommended)
-
-Paste this block into [OpenClaw](https://openclaw.ai) or [Hermes Agent](https://github.com/NousResearch/hermes-agent). The agent will install GBrain, set up your database, import your files, and verify everything works.
-
-```
-GOAL: Install GBrain as my personal knowledge brain. When done, I should
-be able to search my own markdown files with hybrid search (keyword + vector).
-
-YOU MUST COMPLETE EVERY STEP BELOW. Do not skip steps. Do not reorder.
-Each step depends on the previous one. After each step, verify it worked
-before proceeding. If a step fails, stop and fix it. Do not continue
-past a failed step.
-
-STEP 1 — INSTALL GBRAIN
-Run these commands:
-  curl -fsSL https://bun.sh/install | bash
-  source ~/.bashrc
-  bun add github:garrytan/gbrain
-Verify: run `gbrain --version`. You must see a version number.
-If it fails: check that bun is in your PATH.
-
-STEP 2 — CONNECT DATABASE
-Run: gbrain init --supabase
-This starts a wizard. You will need the user's Supabase connection string.
-Tell the user:
-  "I need your Supabase Shared Pooler connection string. Here's how to find it:
-   1. Go to https://supabase.com and open your project
-   2. Click 'Get Connected' next to the project URL
-   3. Select 'Direct Connection String' then 'Session Pooler'
-   4. Copy the 'Shared Pooler' connection string
-   5. Paste it here"
-IMPORTANT: Do NOT ask for the anon key or project URL. Those are wrong.
-The connection string starts with postgresql:// and includes port 6543.
-Verify: run `gbrain doctor --json`. ALL checks must pass.
-If doctor fails: check the connection string, make sure pgvector extension
-exists (gbrain init creates it automatically).
-
-STEP 3 — FIND AND IMPORT MARKDOWN
-Search these directories for markdown files:
-  find ~/git ~/Documents ~/notes ~/brain -maxdepth 3 -name "*.md" 2>/dev/null | head -30
-Pick the directory with the most markdown files. Tell the user which
-directory you found and how many files it contains. Ask: "Found N markdown
-files in /path/. Import these into your brain?"
-If user confirms: run `gbrain import /path/ --no-embed`
-Verify: run `gbrain stats`. Page count must be > 0.
-
-STEP 4 — PROVE SEARCH WORKS
-Run a keyword search using content from the imported files:
-  gbrain search "a relevant term from the imported content"
-You must get at least 1 result. Show the user the result.
-If 0 results: the import failed. Run `gbrain stats` to check page count.
-
-STEP 5 — START EMBEDDINGS
-Run: gbrain embed --stale
-This generates vector embeddings for semantic search. It takes 1-2 minutes
-per 1000 pages. Tell the user: "Generating embeddings for semantic search.
-This takes about [estimated time]. Keyword search already works."
-Verify: run `gbrain stats`. Embedded count must equal chunk count.
-
-STEP 6 — PROVE HYBRID SEARCH WORKS
-Run a semantic query (meaning-based, not keyword match):
-  gbrain query "what are the key themes across these documents?"
-You must get results that show vector + keyword fusion working.
-Show the user. This is the magic moment.
-
-STEP 7 — LOAD THE SKILLPACK
-Read docs/GBRAIN_SKILLPACK.md. This is your operational playbook.
-Adopt these patterns into your behavior immediately:
-  - Brain-first lookup: ALWAYS search the brain before answering questions
-  - Entity detection: detect people, companies, concepts in every message
-  - Source attribution: cite brain pages when using brain knowledge
-  - Iron law of back-linking: every entity mention gets a back-link
-  - Compiled truth: rewrite the synthesis, never the timeline
-Read the individual guides in docs/guides/ for detailed instructions
-on each pattern.
-
-STEP 8 — SET UP LIVE SYNC
-The brain must stay current with the markdown repo. Set up sync:
-  gbrain sync --repo /path/to/brain/ && gbrain embed --stale
-Read docs/guides/live-sync.md for approach options (cron, --watch, webhook).
-Pick whichever fits your environment. Verify: edit a markdown file in the
-repo, run sync, search for the change. The updated content must appear.
-
-STEP 9 — SET UP AUTO-UPDATE
-Run: gbrain check-update --json
-Set up a daily cron or scheduled check. When new versions are available,
-tell the user what's new and ask if they want to upgrade.
-IMPORTANT: Never auto-install updates. Always ask first.
-
-STEP 10 — CHECK AVAILABLE INTEGRATIONS
-Run: gbrain integrations
-Show the user what senses (data inputs) are available. If they want
-any integration (voice-to-brain, email, etc.), run:
-  gbrain integrations show <id>
-and follow the recipe step by step.
-
-STEP 11 — VERIFY EVERYTHING
-Run the verification runbook: read docs/GBRAIN_VERIFY.md
-Execute every check. All must pass. Report results to the user.
-If any check fails, fix it before declaring setup complete.
-
-DONE. Tell the user:
-  "GBrain is set up. You have [N] pages indexed with hybrid search.
-   I will check the brain before answering questions about people,
-   companies, or topics in your knowledge base. Your brain stays
-   current via live sync. Run 'gbrain integrations' to add new
-   senses like voice calls, email, or calendar."
-```
-
-### GBrain without OpenClaw
-
-GBrain works with any AI agent, any MCP client, or no agent at all. Three paths:
-
-#### Standalone CLI
-
-Install globally and use gbrain from the terminal:
-
-```bash
-bun add -g github:garrytan/gbrain
-gbrain init --supabase          # guided wizard, connects to your Postgres
-gbrain import ~/git/brain/      # index your markdown
-gbrain query "what do we know about competitive dynamics?"
-```
-
-The CLI gives you every operation: page CRUD, search, tags, links, timeline, graph traversal, file management, health checks. Run `gbrain --help` for the full list.
-
-#### MCP server (Claude Code, Cursor, Windsurf, etc.)
-
-GBrain exposes 30 MCP tools via stdio. Add this to your MCP client config:
-
-**Claude Code** (`~/.claude/server.json`):
-```json
-{
-  "mcpServers": {
-    "gbrain": {
-      "command": "gbrain",
-      "args": ["serve"]
-    }
-  }
-}
-```
-
-**Cursor** (Settings > MCP Servers):
-```json
-{
-  "gbrain": {
-    "command": "gbrain",
-    "args": ["serve"]
-  }
-}
-```
-
-This gives your agent `get_page`, `put_page`, `search`, `query`, `add_link`, `traverse_graph`, `sync_brain`, `file_upload`, and 22 more tools. All generated from the same operation definitions as the CLI.
-
-#### Remote MCP Server (Claude Desktop, Cowork, Perplexity, ChatGPT)
-
-Access your brain from any device, any AI client. Deploy as a serverless endpoint on your existing Supabase instance:
-
-```bash
-cp .env.production.example .env.production   # fill in 3 values
-bash scripts/deploy-remote.sh                 # links, builds, deploys
-bun run src/commands/auth.ts create "claude-desktop"  # get a token
-```
-
-Then add to your AI client:
-- **Claude Code:** `claude mcp add gbrain -t http https://YOUR_REF.supabase.co/functions/v1/gbrain-mcp/mcp -H "Authorization: Bearer TOKEN"`
-- **Claude Desktop:** Settings > Integrations > Add (NOT JSON config)
-- **Perplexity Computer:** Settings > Connectors > Add remote MCP
-
-Per-client setup guides: [`docs/mcp/`](docs/mcp/DEPLOY.md)
-
-ChatGPT support requires OAuth 2.1 and is coming in v0.7. Self-hosted alternatives (Tailscale Funnel, ngrok) documented in [`docs/mcp/ALTERNATIVES.md`](docs/mcp/ALTERNATIVES.md).
-
-**The tools are not enough.** Your agent needs the playbook. Read [GBRAIN_SKILLPACK.md](docs/GBRAIN_SKILLPACK.md) and load the relevant skills into your agent's system prompt. The skillpack tells the agent WHEN to read, WHEN to write, HOW to enrich, and HOW to keep the brain alive autonomously.
-
-### Skills (operational playbooks)
-
-These are standalone markdown instruction sets. Load them into your agent's context. Each one teaches the agent a complete workflow.
-
-| Skill | What the agent learns | Guide |
-|-------|----------------------|-------|
-| [ingest](skills/ingest/SKILL.md) | Import meetings, docs, articles. Rewrite compiled truth, append timeline, back-link all entities. | [Meeting Ingestion](docs/guides/meeting-ingestion.md) |
-| [query](skills/query/SKILL.md) | 3-layer search (keyword + vector + structured) with synthesis and citations. Never hallucinate. | [Search Modes](docs/guides/search-modes.md) |
-| [maintain](skills/maintain/SKILL.md) | Periodic health: stale compiled truth, orphan pages, dead links, tag inconsistency, missing embeddings. | [Operational Disciplines](docs/guides/operational-disciplines.md) |
-| [enrich](skills/enrich/SKILL.md) | Enrich pages from external APIs. Tiered spend (Tier 1: 10-15 calls, Tier 3: 1-2 calls). | [Enrichment Pipeline](docs/guides/enrichment-pipeline.md) |
-| [briefing](skills/briefing/SKILL.md) | Daily briefing: meetings with attendee context, active deals, time-sensitive threads. | [Executive Assistant](docs/guides/executive-assistant.md) |
-| [migrate](skills/migrate/SKILL.md) | Universal migration from Obsidian, Notion, Logseq, plain markdown, CSV, JSON, Roam. | — |
-| [setup](skills/setup/SKILL.md) | Set up GBrain from scratch: auto-provision Supabase, import, sync, verify. Target < 5 min. | — |
-
-### Integration recipes (self-installing senses)
-
-Run `gbrain integrations` to see available recipes. Your agent reads the recipe and walks you through setup.
-
-| Recipe | Requires | What It Does |
-|--------|----------|-------------|
-| [ngrok-tunnel](recipes/ngrok-tunnel.md) | — | Fixed public URL ($8/mo) |
-| [credential-gateway](recipes/credential-gateway.md) | — | Gmail + Calendar access |
-| [voice-to-brain](recipes/twilio-voice-brain.md) | ngrok-tunnel | Phone calls → brain pages |
-| [email-to-brain](recipes/email-to-brain.md) | credential-gateway | Gmail → entity pages |
-| [x-to-brain](recipes/x-to-brain.md) | — | Twitter → brain pages |
-| [calendar-to-brain](recipes/calendar-to-brain.md) | credential-gateway | Google Calendar → daily pages |
-| [meeting-sync](recipes/meeting-sync.md) | — | Circleback → meeting pages |
-
-Run `gbrain integrations` for status. Dependencies resolve automatically.
-
-#### As a TypeScript library
-
-```bash
-bun add github:garrytan/gbrain
-```
-
-```typescript
-import { PostgresEngine } from 'gbrain';
-
-const engine = new PostgresEngine();
-await engine.connect({ database_url: process.env.DATABASE_URL });
-await engine.initSchema();
-
-// Search
-const results = await engine.searchKeyword('startup growth');
-
-// Read
-const page = await engine.getPage('people/pedro-franceschi');
-
-// Write
-await engine.putPage('concepts/superlinear-returns', {
-  type: 'concept',
-  title: 'Superlinear Returns',
-  compiled_truth: 'Paul Graham argues that returns in many fields are superlinear...',
-  timeline: '- 2023-10-01: Published on paulgraham.com',
-});
-```
-
-The `BrainEngine` interface is pluggable. See `docs/ENGINES.md` for how to add backends.
-
-All paths require a Postgres database with pgvector. Supabase Pro ($25/mo) is the recommended zero-ops option.
 
 ## Upgrade
 
