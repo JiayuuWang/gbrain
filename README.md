@@ -1,82 +1,22 @@
 # GBrain
 
-The memex Vannevar Bush imagined, built for people who think for a living.
+Your AI agent is smart but it doesn't know anything about your life. GBrain fixes that.
 
-> **Requires a frontier model.** GBrain's skills, recipes, and integration guides
-> are written as markdown that your AI agent reads and implements. This only works
-> with models smart enough to interpret intent, not just follow instructions.
-> Tested with **Claude Opus 4.6** and **GPT-5.4 Thinking**. Likely to break with
-> smaller or less capable models. If your agent can't build a WebSocket bridge
-> from an architecture diagram, it's not ready for GBrain.
+> **Requires a frontier model.** GBrain's skills and recipes are markdown that your
+> agent reads and implements. Tested with **Claude Opus 4.6** and **GPT-5.4 Thinking**.
+> Likely to break with smaller models.
 
-## How this happened
+## The Problem
 
-I was setting up my [OpenClaw](https://openclaw.ai) agent and started a markdown brain repo. One page per person, one page per company, compiled truth on top, append-only timeline on the bottom. The agent got smarter the more it knew, so I kept feeding it. Meetings, emails, tweets, Apple Notes, calendar data, original ideas. One thing led to another. Within a week I had:
+You have an OpenClaw or Hermes agent. It can reason, write code, browse the web. But ask it "who should I invite to dinner who knows both Pedro and Diana?" and it has nothing. It doesn't know who Pedro is. It doesn't know your meeting history, your email threads, your original ideas, or your deal pipeline.
 
-- **10,000+ markdown files** indexed and searchable
-- **3,000+ people** with compiled dossiers and relationship history
-- **13 years of calendar data** (21,000+ events)
-- **5,800+ Apple Notes** going back to 2009
-- **280+ meeting transcripts** with AI analysis
-- **300+ captured original ideas** organized by thesis
-- **500+ media pages** (video transcripts, books, articles)
-- Company profiles, food guides, travel logs
-- **Voice calls** that automatically create brain pages (Twilio + OpenAI Realtime)
-
-This is what I actually use day to day. The agent runs while I sleep... literally. The dream cycle scans every conversation from the day, enriches missing entities, fixes broken citations, and consolidates memory. I wake up and the brain is smarter than when I went to sleep. OpenClaw ships this as DREAMS.md. Hermes Agent can do the same with a nightly cron job (see the [cron schedule guide](docs/guides/cron-schedule.md) for setup).
-
-**You don't need Postgres to start.** The knowledge model is just markdown files in a git repo. The [skills](docs/GBRAIN_SKILLPACK.md) and [schema](docs/GBRAIN_RECOMMENDED_SCHEMA.md) work with any AI agent that can read and write files. Start there.
-
-I added Postgres + pgvector later because at 1,000 to 10,000 long markdown docs, `grep` stops working. You need real chunking, real retrieval, real search. GBrain is the thin CLI and MCP layer I built on top of Postgres to solve that, optimized for OpenClaw and smart agents.
-
-### Ask it anything
-
-> "Who should I invite to dinner who knows both Pedro and Diana?"
-> — cross-references the social graph across 3,000+ people pages
-
-> "What have I said about the relationship between shame and founder performance?"
-> — searches YOUR thinking, not the internet
-
-> "What changed with the Series A since Tuesday?"
-> — diffs timeline entries across deal and company pages
-
-> "Prep me for my meeting with Jordan in 30 minutes"
-> — pulls dossier, shared history, recent activity, open threads
-
-Your markdown repo is the source of truth. GBrain makes it searchable. Your AI agent makes it live.
-
-## Why Postgres
-
-At 500 files, `grep` is fine. At 3,000 people pages, 5,800 Apple Notes, and 13 years of calendar data, `grep` falls apart. You need keyword search for exact names, vector search for semantic meaning, and something that fuses both. You need an index that updates incrementally when one file changes, not a full directory walk. You need your agent to find "everyone who was at the board dinner last March" in milliseconds, not 30 seconds of grepping.
-
-GBrain gives you hybrid search that combines keyword and vector approaches, plus a knowledge model that treats every page like an intelligence assessment: compiled truth on top (your current best understanding, rewritten when evidence changes), append-only timeline on the bottom (the evidence trail that never gets edited).
-
-AI agents maintain the brain. You ingest a document and the agent updates every entity mentioned, creates cross-reference links, and appends timeline entries. MCP clients query it. The intelligence lives in fat markdown skills, not application code.
-
-## The Compounding Thesis
-
-Most tools help you find things. GBrain makes you smarter over time.
-
-The core loop:
-
-```
-Signal arrives (meeting, email, tweet, link)
-  → Agent detects entities (people, companies, ideas)
-  → READ: check the brain first (gbrain search, gbrain get)
-  → Respond with full context
-  → WRITE: update brain pages with new information
-  → Sync: gbrain indexes changes for next query
-```
-
-Every cycle through this loop adds knowledge. The agent enriches a person page after a meeting. Next time that person comes up, the agent already has context — their role, your history, what they care about, what you discussed last time. You never start from zero.
-
-An agent without this loop answers from stale context. An agent with it gets smarter every conversation. The difference compounds daily.
-
-Never do anything twice. If you look someone up once, that lookup lives in the brain forever. If a pattern emerges across three meetings, the agent captures it. If you generate an original idea in conversation, it goes to `originals/` — your searchable intellectual archive.
+**GBrain gives your agent a brain.** Meetings, emails, tweets, calendar events, voice calls, Apple Notes, original ideas... all of it flows into a searchable knowledge base that your agent reads before every response and writes to after every conversation. The agent gets smarter every day. It compounds.
 
 ## Getting Data In
 
-Your brain gets new senses as they're built. Run `gbrain integrations` to see what's available.
+This is the #1 blocker. Your agent needs data. GBrain ships integration recipes that your agent sets up for you. It reads the recipe, asks for API keys, validates each one, and configures everything. [Markdown is code](docs/ethos/THIN_HARNESS_FAT_SKILLS.md)... the recipe IS the installer.
+
+Run `gbrain integrations` to see what's available:
 
 | Recipe | Requires | What It Does |
 |--------|----------|-------------|
@@ -94,6 +34,42 @@ if you install voice-to-brain, the agent sets up ngrok-tunnel first.
 Your agent sets up each integration for you. It reads the recipe, asks for API keys, validates each one, and runs a smoke test. [Markdown is code](docs/ethos/THIN_HARNESS_FAT_SKILLS.md) — the recipe IS the installer.
 
 See [Getting Data In](docs/integrations/README.md) for the full guide and the [Skillpack](docs/GBRAIN_SKILLPACK.md) for all capabilities.
+
+## The Compounding Thesis
+
+Most tools help you find things. GBrain makes you smarter over time.
+
+```
+Signal arrives (meeting, email, tweet, link)
+  → Agent detects entities (people, companies, ideas)
+  → READ: check the brain first (gbrain search, gbrain get)
+  → Respond with full context
+  → WRITE: update brain pages with new information
+  → Sync: gbrain indexes changes for next query
+```
+
+Every cycle through this loop adds knowledge. The agent enriches a person page after a meeting. Next time that person comes up, the agent already has context. You never start from zero.
+
+An agent without this loop answers from stale context. An agent with it gets smarter every conversation. The difference compounds daily.
+
+> "Who should I invite to dinner who knows both Pedro and Diana?"
+> — cross-references the social graph across 3,000+ people pages
+
+> "What have I said about the relationship between shame and founder performance?"
+> — searches YOUR thinking, not the internet
+
+> "Prep me for my meeting with Jordan in 30 minutes"
+> — pulls dossier, shared history, recent activity, open threads
+
+## How this happened
+
+I was setting up my [OpenClaw](https://openclaw.ai) agent and started a markdown brain repo. One page per person, one page per company, compiled truth on top, append-only timeline on the bottom. The agent got smarter the more it knew, so I kept feeding it. Within a week I had 10,000+ markdown files, 3,000+ people with compiled dossiers, 13 years of calendar data, 280+ meeting transcripts, and 300+ captured original ideas.
+
+The agent runs while I sleep. The dream cycle scans every conversation, enriches missing entities, fixes broken citations, and consolidates memory. I wake up and the brain is smarter than when I went to sleep. See the [cron schedule guide](docs/guides/cron-schedule.md) for setup.
+
+**You don't need Postgres to start.** The knowledge model is just markdown files in a git repo. The [skills](docs/GBRAIN_SKILLPACK.md) and [schema](docs/GBRAIN_RECOMMENDED_SCHEMA.md) work with any AI agent that can read and write files.
+
+**When you need Postgres:** at 1,000+ files, `grep` stops working. GBrain adds hybrid search (keyword + vector + RRF fusion) on top of Postgres + pgvector. The CLI and MCP layer handle chunking, embedding, and incremental sync. Add Postgres when search speed matters, or when you want Claude Desktop, ChatGPT, Perplexity, or other MCP clients to connect to your brain remotely.
 
 ## Architecture
 
