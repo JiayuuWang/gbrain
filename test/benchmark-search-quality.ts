@@ -1,39 +1,50 @@
 /**
- * Search Quality Benchmark — measures impact of PR #64 changes.
+ * Search Quality Benchmark — Rich benchmark with realistic overlap and noise.
  *
- * Seeds a PGLite brain with test pages, runs queries with and without
- * compiled truth boost, and outputs comparative metrics.
+ * 30 pages, 60 chunks, 20 queries with graded relevance. Tests ranking quality
+ * in a brain with overlapping topics, multiple mentions, and temporal ambiguity.
+ *
+ * All data is fictional. No private information.
  *
  * Usage: bun run test/benchmark-search-quality.ts
  */
 
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { rrfFusion, hybridSearch } from '../src/core/search/hybrid.ts';
+import { rrfFusion } from '../src/core/search/hybrid.ts';
 import { dedupResults } from '../src/core/search/dedup.ts';
 import { precisionAtK, recallAtK, mrr, ndcgAtK } from '../src/core/search/eval.ts';
 import { autoDetectDetail } from '../src/core/search/intent.ts';
 import type { SearchResult, ChunkInput } from '../src/core/types.ts';
 
-// ─── Config ──────────────────────────────────────────────────────
-
-const BOOST_FACTOR = 2.0;
 const RRF_K = 60;
 
-function basisEmbedding(idx: number, dim = 1536): Float32Array {
+// ─── Embedding helpers ───────────────────────────────────────────
+
+// Create embeddings with shared dimensions to simulate semantic overlap.
+// Each "topic" gets a primary dimension. Related topics share secondary dimensions.
+function topicEmbedding(topics: Record<number, number>, dim = 1536): Float32Array {
   const emb = new Float32Array(dim);
-  emb[idx % dim] = 1.0;
+  for (const [idx, weight] of Object.entries(topics)) {
+    emb[Number(idx) % dim] = weight;
+  }
+  // Normalize
+  let mag = 0;
+  for (let i = 0; i < dim; i++) mag += emb[i] * emb[i];
+  mag = Math.sqrt(mag);
+  if (mag > 0) for (let i = 0; i < dim; i++) emb[i] /= mag;
   return emb;
 }
 
-// Blend two basis vectors to simulate partial relevance
-function blendEmbedding(idx1: number, idx2: number, weight1 = 0.8, dim = 1536): Float32Array {
-  const emb = new Float32Array(dim);
-  emb[idx1 % dim] = weight1;
-  emb[idx2 % dim] = 1 - weight1;
-  return emb;
-}
+// Topic dimensions (semantic axes)
+const T = {
+  AI: 0, FINTECH: 1, CRYPTO: 2, CLIMATE: 3, HEALTH: 4,
+  ENTERPRISE: 5, CONSUMER: 6, ROBOTICS: 7, EDUCATION: 8, BIOTECH: 9,
+  FOUNDER: 10, INVESTOR: 11, ENGINEER: 12, DESIGNER: 13,
+  MEETING: 20, ANNOUNCEMENT: 21, FUNDING: 22, LAUNCH: 23, HIRING: 24,
+  COMPILED: 30, TIMELINE: 31,
+};
 
-// ─── Test Data ───────────────────────────────────────────────────
+// ─── Test Data: 30 fictional pages ──────────────────────────────
 
 interface TestPage {
   slug: string;
@@ -45,137 +56,370 @@ interface TestPage {
 }
 
 const PAGES: TestPage[] = [
+  // ── People (10) ──────────────────────────────────────────────
   {
-    slug: 'people/pedro',
+    slug: 'people/alice-chen',
     type: 'person',
-    title: 'Pedro Franceschi',
-    compiled_truth: 'Pedro is the co-founder of Brex. Expert in fintech payments infrastructure and AI security.',
-    timeline: '2024-03-15: Met Pedro at YC dinner. Discussed Crab Trap AI security project.',
+    title: 'Alice Chen',
+    compiled_truth: 'Alice Chen is the CEO of NovaPay, a fintech startup building instant cross-border payments for SMBs. Previously VP Engineering at Stripe. Deep expertise in payment rails and regulatory compliance.',
+    timeline: '2024-03-15: Met Alice at Fintech Forum. Discussed cross-border payment challenges in Southeast Asia. She mentioned NovaPay is expanding to Vietnam.\n2024-06-20: Coffee with Alice. NovaPay raised Series B. Hiring aggressively.',
     chunks: [
-      { chunk_index: 0, chunk_text: 'Pedro is the co-founder of Brex. Expert in fintech payments infrastructure and AI security.', chunk_source: 'compiled_truth', embedding: blendEmbedding(0, 10), token_count: 18 },
-      { chunk_index: 1, chunk_text: '2024-03-15: Met Pedro at YC dinner. Discussed Crab Trap AI security project.', chunk_source: 'timeline', embedding: blendEmbedding(1, 10), token_count: 16 },
+      { chunk_index: 0, chunk_text: 'Alice Chen is the CEO of NovaPay, a fintech startup building instant cross-border payments for SMBs. Previously VP Engineering at Stripe. Deep expertise in payment rails and regulatory compliance.', chunk_source: 'compiled_truth', embedding: topicEmbedding({[T.FINTECH]: 1, [T.FOUNDER]: 0.6, [T.ENTERPRISE]: 0.3}), token_count: 35 },
+      { chunk_index: 1, chunk_text: '2024-03-15: Met Alice at Fintech Forum. Discussed cross-border payment challenges in Southeast Asia. NovaPay expanding to Vietnam. 2024-06-20: Coffee with Alice. NovaPay raised Series B. Hiring aggressively.', chunk_source: 'timeline', embedding: topicEmbedding({[T.FINTECH]: 0.5, [T.MEETING]: 0.8, [T.FUNDING]: 0.4}), token_count: 40 },
     ],
   },
   {
-    slug: 'companies/variant',
-    type: 'company',
-    title: 'Variant Fund',
-    compiled_truth: 'Variant is a crypto-native investment firm focused on web3 ownership economy. Led by Jesse Walden.',
-    timeline: '2024-06-01: Variant announced new $450M fund. Jesse presented at token summit.',
-    chunks: [
-      { chunk_index: 0, chunk_text: 'Variant is a crypto-native investment firm focused on web3 ownership economy. Led by Jesse Walden.', chunk_source: 'compiled_truth', embedding: blendEmbedding(2, 11), token_count: 18 },
-      { chunk_index: 1, chunk_text: '2024-06-01: Variant announced new $450M fund. Jesse presented at token summit.', chunk_source: 'timeline', embedding: blendEmbedding(3, 11), token_count: 15 },
-    ],
-  },
-  {
-    slug: 'concepts/ai-philosophy',
-    type: 'concept',
-    title: 'AI Changes Who Gets to Build',
-    compiled_truth: 'AI democratizes building. The marginal cost of creation approaches zero. This is the most important shift in a generation.',
-    timeline: '2024-01-10: First wrote about AI and building access. Shared on X. 50K impressions.',
-    chunks: [
-      { chunk_index: 0, chunk_text: 'AI democratizes building. The marginal cost of creation approaches zero. This is the most important shift in a generation.', chunk_source: 'compiled_truth', embedding: blendEmbedding(4, 12), token_count: 22 },
-      { chunk_index: 1, chunk_text: '2024-01-10: First wrote about AI and building access. Shared on X. 50K impressions.', chunk_source: 'timeline', embedding: blendEmbedding(5, 12), token_count: 17 },
-    ],
-  },
-  {
-    slug: 'people/jesse',
+    slug: 'people/bob-martinez',
     type: 'person',
-    title: 'Jesse Walden',
-    compiled_truth: 'Jesse Walden is the founder of Variant Fund. Previously at a16z crypto. Focuses on ownership economy and creator tokens.',
-    timeline: '2024-04-20: Coffee with Jesse. Discussed token-gated communities and creator economy.',
+    title: 'Bob Martinez',
+    compiled_truth: 'Bob Martinez is a partner at Green Horizon Ventures, focused on climate tech and clean energy investments. Board member at SolarGrid and WindFlow. Former McKinsey energy practice.',
+    timeline: '2024-04-10: Lunch with Bob. He is bullish on grid-scale battery storage. Mentioned a new fund for carbon capture.\n2024-08-05: Bob introduced me to the SolarGrid founder.',
     chunks: [
-      { chunk_index: 0, chunk_text: 'Jesse Walden is the founder of Variant Fund. Previously at a16z crypto. Focuses on ownership economy and creator tokens.', chunk_source: 'compiled_truth', embedding: blendEmbedding(6, 13), token_count: 22 },
-      { chunk_index: 1, chunk_text: '2024-04-20: Coffee with Jesse. Discussed token-gated communities and creator economy.', chunk_source: 'timeline', embedding: blendEmbedding(7, 13), token_count: 15 },
+      { chunk_index: 0, chunk_text: 'Bob Martinez is a partner at Green Horizon Ventures, focused on climate tech and clean energy investments. Board member at SolarGrid and WindFlow. Former McKinsey energy practice.', chunk_source: 'compiled_truth', embedding: topicEmbedding({[T.CLIMATE]: 1, [T.INVESTOR]: 0.7, [T.ENTERPRISE]: 0.2}), token_count: 32 },
+      { chunk_index: 1, chunk_text: '2024-04-10: Lunch with Bob. Bullish on grid-scale battery storage. New fund for carbon capture. 2024-08-05: Bob introduced me to SolarGrid founder.', chunk_source: 'timeline', embedding: topicEmbedding({[T.CLIMATE]: 0.5, [T.MEETING]: 0.8, [T.FUNDING]: 0.3}), token_count: 30 },
     ],
   },
   {
-    slug: 'companies/brex',
-    type: 'company',
-    title: 'Brex',
-    compiled_truth: 'Brex is a fintech company providing corporate cards and spend management. Founded by Pedro Franceschi and Henrique Dubugras. YC W17.',
-    timeline: '2024-02-28: Brex announced AI-powered expense management. Revenue growth strong.',
+    slug: 'people/carol-nakamura',
+    type: 'person',
+    title: 'Carol Nakamura',
+    compiled_truth: 'Carol Nakamura is CTO of MindBridge, an AI company building diagnostic tools for mental health professionals. PhD in computational neuroscience from MIT. Pioneer in applying transformer models to clinical psychology.',
+    timeline: '2024-02-28: Carol presented at AI Health Summit. MindBridge accuracy data is impressive, 94% concordance with clinical diagnosis.\n2024-07-12: Carol reached out about Series A. Looking for $15M.',
     chunks: [
-      { chunk_index: 0, chunk_text: 'Brex is a fintech company providing corporate cards and spend management. Founded by Pedro Franceschi and Henrique Dubugras. YC W17.', chunk_source: 'compiled_truth', embedding: blendEmbedding(8, 14), token_count: 24 },
-      { chunk_index: 1, chunk_text: '2024-02-28: Brex announced AI-powered expense management. Revenue growth strong.', chunk_source: 'timeline', embedding: blendEmbedding(9, 14), token_count: 14 },
+      { chunk_index: 0, chunk_text: 'Carol Nakamura is CTO of MindBridge, an AI company building diagnostic tools for mental health professionals. PhD in computational neuroscience from MIT. Pioneer in transformer models for clinical psychology.', chunk_source: 'compiled_truth', embedding: topicEmbedding({[T.AI]: 0.7, [T.HEALTH]: 0.8, [T.FOUNDER]: 0.4, [T.ENGINEER]: 0.3}), token_count: 35 },
+      { chunk_index: 1, chunk_text: '2024-02-28: Carol presented at AI Health Summit. MindBridge 94% concordance with clinical diagnosis. 2024-07-12: Carol reached out about Series A, looking for $15M.', chunk_source: 'timeline', embedding: topicEmbedding({[T.AI]: 0.3, [T.HEALTH]: 0.4, [T.MEETING]: 0.6, [T.FUNDING]: 0.5}), token_count: 32 },
+    ],
+  },
+  {
+    slug: 'people/david-okonkwo',
+    type: 'person',
+    title: 'David Okonkwo',
+    compiled_truth: 'David Okonkwo is founder of EduStack, an AI-powered adaptive learning platform. Previously taught CS at Stanford. Believes personalized education is the biggest unlocked market in tech.',
+    timeline: '2024-05-02: David demoed EduStack at demo day. The adaptive curriculum engine is genuinely novel.\n2024-09-18: David shipped v2 with real-time assessment. Growing 40% MoM in Nigeria.',
+    chunks: [
+      { chunk_index: 0, chunk_text: 'David Okonkwo is founder of EduStack, an AI-powered adaptive learning platform. Previously taught CS at Stanford. Believes personalized education is the biggest unlocked market in tech.', chunk_source: 'compiled_truth', embedding: topicEmbedding({[T.AI]: 0.5, [T.EDUCATION]: 1, [T.FOUNDER]: 0.6}), token_count: 32 },
+      { chunk_index: 1, chunk_text: '2024-05-02: David demoed EduStack at demo day. Adaptive curriculum engine is novel. 2024-09-18: David shipped v2 with real-time assessment. Growing 40% MoM in Nigeria.', chunk_source: 'timeline', embedding: topicEmbedding({[T.EDUCATION]: 0.5, [T.LAUNCH]: 0.7, [T.MEETING]: 0.4}), token_count: 35 },
+    ],
+  },
+  {
+    slug: 'people/elena-volkov',
+    type: 'person',
+    title: 'Elena Volkov',
+    compiled_truth: 'Elena Volkov is co-founder of CryptoSafe, building institutional-grade custody for digital assets. Former security engineer at Google. Expert in HSM architecture and multi-party computation.',
+    timeline: '2024-01-20: Elena gave a talk on MPC wallets at ETH Denver. Very technical, very sharp.\n2024-06-15: CryptoSafe announced $30M Series A led by a16z crypto.',
+    chunks: [
+      { chunk_index: 0, chunk_text: 'Elena Volkov is co-founder of CryptoSafe, building institutional-grade custody for digital assets. Former security engineer at Google. Expert in HSM architecture and multi-party computation.', chunk_source: 'compiled_truth', embedding: topicEmbedding({[T.CRYPTO]: 0.8, [T.ENTERPRISE]: 0.5, [T.ENGINEER]: 0.6, [T.FOUNDER]: 0.3}), token_count: 32 },
+      { chunk_index: 1, chunk_text: '2024-01-20: Elena talk on MPC wallets at ETH Denver. Very technical. 2024-06-15: CryptoSafe announced $30M Series A led by a16z crypto.', chunk_source: 'timeline', embedding: topicEmbedding({[T.CRYPTO]: 0.5, [T.ANNOUNCEMENT]: 0.6, [T.FUNDING]: 0.7}), token_count: 28 },
+    ],
+  },
+  {
+    slug: 'people/frank-dubois',
+    type: 'person',
+    title: 'Frank Dubois',
+    compiled_truth: 'Frank Dubois is head of AI at RoboLogic, building autonomous warehouse robots. 15 years in robotics, previously at Boston Dynamics. Focused on manipulation in unstructured environments.',
+    timeline: '2024-03-22: Frank showed the latest RoboLogic demo. Picking irregular objects at 98% accuracy.\n2024-11-01: RoboLogic deployed at Amazon fulfillment center in Memphis.',
+    chunks: [
+      { chunk_index: 0, chunk_text: 'Frank Dubois is head of AI at RoboLogic, building autonomous warehouse robots. 15 years in robotics, previously at Boston Dynamics. Focused on manipulation in unstructured environments.', chunk_source: 'compiled_truth', embedding: topicEmbedding({[T.AI]: 0.6, [T.ROBOTICS]: 1, [T.ENGINEER]: 0.5}), token_count: 30 },
+      { chunk_index: 1, chunk_text: '2024-03-22: Frank showed RoboLogic demo. Picking irregular objects at 98% accuracy. 2024-11-01: RoboLogic deployed at Amazon fulfillment center in Memphis.', chunk_source: 'timeline', embedding: topicEmbedding({[T.ROBOTICS]: 0.6, [T.LAUNCH]: 0.7, [T.MEETING]: 0.3}), token_count: 28 },
+    ],
+  },
+  {
+    slug: 'people/grace-lee',
+    type: 'person',
+    title: 'Grace Lee',
+    compiled_truth: 'Grace Lee is a designer and founder of PixelCraft, a design tool for AI-generated UI components. Former lead designer at Figma. Strong opinions on AI replacing mockups with working prototypes.',
+    timeline: '2024-04-30: Grace launched PixelCraft beta. 5000 signups in first week.\n2024-08-15: Grace hired 3 engineers from Vercel. PixelCraft growing fast.',
+    chunks: [
+      { chunk_index: 0, chunk_text: 'Grace Lee is a designer and founder of PixelCraft, a design tool for AI-generated UI components. Former lead designer at Figma. Strong opinions on AI replacing mockups with working prototypes.', chunk_source: 'compiled_truth', embedding: topicEmbedding({[T.AI]: 0.5, [T.DESIGNER]: 0.9, [T.CONSUMER]: 0.4, [T.FOUNDER]: 0.5}), token_count: 34 },
+      { chunk_index: 1, chunk_text: '2024-04-30: Grace launched PixelCraft beta. 5000 signups first week. 2024-08-15: Grace hired 3 engineers from Vercel. Growing fast.', chunk_source: 'timeline', embedding: topicEmbedding({[T.DESIGNER]: 0.3, [T.LAUNCH]: 0.8, [T.HIRING]: 0.5}), token_count: 25 },
+    ],
+  },
+  {
+    slug: 'people/hiro-tanaka',
+    type: 'person',
+    title: 'Hiro Tanaka',
+    compiled_truth: 'Hiro Tanaka is CEO of GenomeAI, using large language models to predict protein folding for drug discovery. Previously research scientist at DeepMind. Published 40+ papers on computational biology.',
+    timeline: '2024-02-14: Hiro presented GenomeAI results at Bio conference. Beat AlphaFold on 3 benchmarks.\n2024-10-20: GenomeAI partnered with Pfizer for oncology drug discovery pipeline.',
+    chunks: [
+      { chunk_index: 0, chunk_text: 'Hiro Tanaka is CEO of GenomeAI, using large language models to predict protein folding for drug discovery. Previously research scientist at DeepMind. Published 40+ papers on computational biology.', chunk_source: 'compiled_truth', embedding: topicEmbedding({[T.AI]: 0.7, [T.BIOTECH]: 0.9, [T.FOUNDER]: 0.4}), token_count: 34 },
+      { chunk_index: 1, chunk_text: '2024-02-14: Hiro presented GenomeAI results. Beat AlphaFold on 3 benchmarks. 2024-10-20: GenomeAI partnered with Pfizer for oncology drug discovery.', chunk_source: 'timeline', embedding: topicEmbedding({[T.BIOTECH]: 0.6, [T.ANNOUNCEMENT]: 0.5, [T.MEETING]: 0.4}), token_count: 28 },
+    ],
+  },
+  {
+    slug: 'people/iris-washington',
+    type: 'person',
+    title: 'Iris Washington',
+    compiled_truth: 'Iris Washington is VP of Product at CloudScale, an enterprise infrastructure company. Expert in developer experience and platform engineering. Previously PM at AWS Lambda team.',
+    timeline: '2024-05-18: Iris spoke at re:Invent about serverless at scale. Great talk on cold start optimization.\n2024-09-03: CloudScale acquired by Datadog for $2.1B.',
+    chunks: [
+      { chunk_index: 0, chunk_text: 'Iris Washington is VP of Product at CloudScale, an enterprise infrastructure company. Expert in developer experience and platform engineering. Previously PM at AWS Lambda team.', chunk_source: 'compiled_truth', embedding: topicEmbedding({[T.ENTERPRISE]: 0.9, [T.ENGINEER]: 0.5, [T.AI]: 0.2}), token_count: 30 },
+      { chunk_index: 1, chunk_text: '2024-05-18: Iris spoke at re:Invent about serverless at scale. Cold start optimization. 2024-09-03: CloudScale acquired by Datadog for $2.1B.', chunk_source: 'timeline', embedding: topicEmbedding({[T.ENTERPRISE]: 0.4, [T.ANNOUNCEMENT]: 0.7, [T.MEETING]: 0.3}), token_count: 28 },
+    ],
+  },
+  {
+    slug: 'people/james-park',
+    type: 'person',
+    title: 'James Park',
+    compiled_truth: 'James Park is a climate tech investor and founder of TerraFund. Focuses on hard tech: carbon capture, nuclear fusion, and sustainable materials. Believes climate is a $50T market by 2040.',
+    timeline: '2024-07-22: James announced TerraFund II, $500M for climate deep tech.\n2024-11-15: Met James at Climate Week. He invested in 3 fusion startups this year.',
+    chunks: [
+      { chunk_index: 0, chunk_text: 'James Park is a climate tech investor and founder of TerraFund. Focuses on hard tech: carbon capture, nuclear fusion, sustainable materials. Climate is a $50T market by 2040.', chunk_source: 'compiled_truth', embedding: topicEmbedding({[T.CLIMATE]: 0.9, [T.INVESTOR]: 0.8, [T.FOUNDER]: 0.3}), token_count: 32 },
+      { chunk_index: 1, chunk_text: '2024-07-22: James announced TerraFund II, $500M for climate deep tech. 2024-11-15: Met James at Climate Week. Invested in 3 fusion startups.', chunk_source: 'timeline', embedding: topicEmbedding({[T.CLIMATE]: 0.5, [T.FUNDING]: 0.8, [T.MEETING]: 0.4}), token_count: 28 },
+    ],
+  },
+
+  // ── Companies (10) ───────────────────────────────────────────
+  {
+    slug: 'companies/novapay',
+    type: 'company',
+    title: 'NovaPay',
+    compiled_truth: 'NovaPay builds instant cross-border payments for SMBs. Founded by Alice Chen (ex-Stripe). Series B stage, expanding across Southeast Asia. Regulatory-first approach differentiates from competitors.',
+    timeline: '2024-01-15: NovaPay launched in Thailand. 2024-06-20: Raised $45M Series B. 2024-09-01: Processed $1B in cross-border volume.',
+    chunks: [
+      { chunk_index: 0, chunk_text: 'NovaPay builds instant cross-border payments for SMBs. Founded by Alice Chen (ex-Stripe). Series B stage, expanding across Southeast Asia. Regulatory-first approach differentiates.', chunk_source: 'compiled_truth', embedding: topicEmbedding({[T.FINTECH]: 1, [T.ENTERPRISE]: 0.4}), token_count: 30 },
+      { chunk_index: 1, chunk_text: '2024-01-15: NovaPay launched in Thailand. 2024-06-20: Raised $45M Series B. 2024-09-01: Processed $1B in cross-border volume.', chunk_source: 'timeline', embedding: topicEmbedding({[T.FINTECH]: 0.4, [T.LAUNCH]: 0.5, [T.FUNDING]: 0.6}), token_count: 25 },
+    ],
+  },
+  {
+    slug: 'companies/mindbridge',
+    type: 'company',
+    title: 'MindBridge',
+    compiled_truth: 'MindBridge builds AI diagnostic tools for mental health. 94% concordance with clinical diagnosis. Used by 200+ clinics. Carol Nakamura (CTO) leads the technical vision.',
+    timeline: '2024-02-28: Presented at AI Health Summit. 2024-07-12: Series A fundraising, targeting $15M. 2024-10-01: FDA breakthrough device designation.',
+    chunks: [
+      { chunk_index: 0, chunk_text: 'MindBridge builds AI diagnostic tools for mental health. 94% concordance with clinical diagnosis. Used by 200+ clinics. Carol Nakamura leads technical vision.', chunk_source: 'compiled_truth', embedding: topicEmbedding({[T.AI]: 0.6, [T.HEALTH]: 0.9, [T.ENTERPRISE]: 0.3}), token_count: 28 },
+      { chunk_index: 1, chunk_text: '2024-02-28: AI Health Summit presentation. 2024-07-12: Series A targeting $15M. 2024-10-01: FDA breakthrough device designation.', chunk_source: 'timeline', embedding: topicEmbedding({[T.HEALTH]: 0.5, [T.FUNDING]: 0.5, [T.ANNOUNCEMENT]: 0.6}), token_count: 22 },
+    ],
+  },
+  {
+    slug: 'companies/cryptosafe',
+    type: 'company',
+    title: 'CryptoSafe',
+    compiled_truth: 'CryptoSafe provides institutional-grade custody for digital assets using multi-party computation. Founded by Elena Volkov (ex-Google security). $30M Series A from a16z crypto.',
+    timeline: '2024-01-20: ETH Denver demo. 2024-06-15: $30M Series A announced. 2024-10-30: Onboarded first sovereign wealth fund client.',
+    chunks: [
+      { chunk_index: 0, chunk_text: 'CryptoSafe provides institutional-grade custody for digital assets using multi-party computation. Founded by Elena Volkov. $30M Series A from a16z crypto.', chunk_source: 'compiled_truth', embedding: topicEmbedding({[T.CRYPTO]: 0.9, [T.ENTERPRISE]: 0.5, [T.FINTECH]: 0.3}), token_count: 26 },
+      { chunk_index: 1, chunk_text: '2024-01-20: ETH Denver demo. 2024-06-15: $30M Series A. 2024-10-30: First sovereign wealth fund client.', chunk_source: 'timeline', embedding: topicEmbedding({[T.CRYPTO]: 0.4, [T.FUNDING]: 0.7, [T.ANNOUNCEMENT]: 0.5}), token_count: 20 },
+    ],
+  },
+  {
+    slug: 'companies/robologic',
+    type: 'company',
+    title: 'RoboLogic',
+    compiled_truth: 'RoboLogic builds autonomous warehouse robots for irregular object picking. 98% accuracy on unstructured items. Frank Dubois (head of AI) leads R&D. Deployed at major fulfillment centers.',
+    timeline: '2024-03-22: Demo day showing. 2024-11-01: Amazon fulfillment deployment in Memphis.',
+    chunks: [
+      { chunk_index: 0, chunk_text: 'RoboLogic builds autonomous warehouse robots for irregular object picking. 98% accuracy. Frank Dubois leads R&D. Deployed at major fulfillment centers.', chunk_source: 'compiled_truth', embedding: topicEmbedding({[T.ROBOTICS]: 0.9, [T.AI]: 0.6, [T.ENTERPRISE]: 0.4}), token_count: 25 },
+      { chunk_index: 1, chunk_text: '2024-03-22: Demo day showing. 2024-11-01: Amazon fulfillment deployment in Memphis.', chunk_source: 'timeline', embedding: topicEmbedding({[T.ROBOTICS]: 0.4, [T.LAUNCH]: 0.8}), token_count: 15 },
+    ],
+  },
+  {
+    slug: 'companies/edustack',
+    type: 'company',
+    title: 'EduStack',
+    compiled_truth: 'EduStack is an AI-powered adaptive learning platform. Personalizes curriculum in real-time based on student performance. Founded by David Okonkwo (ex-Stanford CS). Growing 40% MoM in Nigeria.',
+    timeline: '2024-05-02: Demo day presentation. 2024-09-18: V2 launch with real-time assessment. 2024-12-01: Expanded to Kenya and Ghana.',
+    chunks: [
+      { chunk_index: 0, chunk_text: 'EduStack is an AI-powered adaptive learning platform. Personalizes curriculum in real-time. Founded by David Okonkwo. Growing 40% MoM in Nigeria.', chunk_source: 'compiled_truth', embedding: topicEmbedding({[T.AI]: 0.5, [T.EDUCATION]: 0.9, [T.CONSUMER]: 0.4}), token_count: 26 },
+      { chunk_index: 1, chunk_text: '2024-05-02: Demo day. 2024-09-18: V2 with real-time assessment. 2024-12-01: Expanded to Kenya and Ghana.', chunk_source: 'timeline', embedding: topicEmbedding({[T.EDUCATION]: 0.4, [T.LAUNCH]: 0.7, [T.ANNOUNCEMENT]: 0.3}), token_count: 20 },
+    ],
+  },
+  {
+    slug: 'companies/pixelcraft',
+    type: 'company', title: 'PixelCraft',
+    compiled_truth: 'PixelCraft is a design tool that generates working UI components from natural language. Founded by Grace Lee (ex-Figma). 5000 signups in first week of beta.',
+    timeline: '2024-04-30: Beta launch, 5000 signups. 2024-08-15: Hired 3 Vercel engineers.',
+    chunks: [
+      { chunk_index: 0, chunk_text: 'PixelCraft generates working UI components from natural language. Founded by Grace Lee (ex-Figma). 5000 signups first week.', chunk_source: 'compiled_truth', embedding: topicEmbedding({[T.AI]: 0.6, [T.DESIGNER]: 0.8, [T.CONSUMER]: 0.5}), token_count: 22 },
+      { chunk_index: 1, chunk_text: '2024-04-30: Beta launch, 5000 signups. 2024-08-15: Hired 3 Vercel engineers.', chunk_source: 'timeline', embedding: topicEmbedding({[T.LAUNCH]: 0.8, [T.HIRING]: 0.6}), token_count: 14 },
+    ],
+  },
+  {
+    slug: 'companies/genomeai',
+    type: 'company', title: 'GenomeAI',
+    compiled_truth: 'GenomeAI uses LLMs to predict protein folding for drug discovery. Beat AlphaFold on 3 benchmarks. CEO Hiro Tanaka (ex-DeepMind). Partnered with Pfizer.',
+    timeline: '2024-02-14: Bio conference results. 2024-10-20: Pfizer partnership announced.',
+    chunks: [
+      { chunk_index: 0, chunk_text: 'GenomeAI uses LLMs to predict protein folding for drug discovery. Beat AlphaFold on 3 benchmarks. CEO Hiro Tanaka. Pfizer partnership.', chunk_source: 'compiled_truth', embedding: topicEmbedding({[T.AI]: 0.7, [T.BIOTECH]: 0.9}), token_count: 24 },
+      { chunk_index: 1, chunk_text: '2024-02-14: Bio conference, beat AlphaFold. 2024-10-20: Pfizer partnership for oncology.', chunk_source: 'timeline', embedding: topicEmbedding({[T.BIOTECH]: 0.5, [T.ANNOUNCEMENT]: 0.7}), token_count: 16 },
+    ],
+  },
+  {
+    slug: 'companies/terrafund',
+    type: 'company', title: 'TerraFund',
+    compiled_truth: 'TerraFund is a $500M climate deep tech fund. Founded by James Park. Invests in carbon capture, nuclear fusion, and sustainable materials. Three fusion investments in 2024.',
+    timeline: '2024-07-22: TerraFund II announced at $500M. 2024-11-15: Climate Week panel.',
+    chunks: [
+      { chunk_index: 0, chunk_text: 'TerraFund is a $500M climate deep tech fund. Founded by James Park. Carbon capture, nuclear fusion, sustainable materials.', chunk_source: 'compiled_truth', embedding: topicEmbedding({[T.CLIMATE]: 0.9, [T.INVESTOR]: 0.6, [T.FUNDING]: 0.3}), token_count: 22 },
+      { chunk_index: 1, chunk_text: '2024-07-22: TerraFund II at $500M. 2024-11-15: Climate Week panel.', chunk_source: 'timeline', embedding: topicEmbedding({[T.CLIMATE]: 0.4, [T.FUNDING]: 0.8, [T.ANNOUNCEMENT]: 0.5}), token_count: 14 },
+    ],
+  },
+  {
+    slug: 'companies/cloudscale',
+    type: 'company', title: 'CloudScale',
+    compiled_truth: 'CloudScale is an enterprise infrastructure company focused on serverless at scale. Iris Washington is VP Product. Acquired by Datadog for $2.1B in 2024.',
+    timeline: '2024-05-18: re:Invent talk on cold starts. 2024-09-03: Datadog acquisition at $2.1B.',
+    chunks: [
+      { chunk_index: 0, chunk_text: 'CloudScale is enterprise infrastructure for serverless at scale. VP Product Iris Washington. Acquired by Datadog for $2.1B.', chunk_source: 'compiled_truth', embedding: topicEmbedding({[T.ENTERPRISE]: 0.9, [T.AI]: 0.2}), token_count: 22 },
+      { chunk_index: 1, chunk_text: '2024-05-18: re:Invent cold start talk. 2024-09-03: Datadog acquired CloudScale for $2.1B.', chunk_source: 'timeline', embedding: topicEmbedding({[T.ENTERPRISE]: 0.3, [T.ANNOUNCEMENT]: 0.8}), token_count: 16 },
+    ],
+  },
+  {
+    slug: 'companies/solargrid',
+    type: 'company', title: 'SolarGrid',
+    compiled_truth: 'SolarGrid builds distributed solar micro-grids for rural electrification. Bob Martinez is a board member. Operating in 12 African countries.',
+    timeline: '2024-08-05: Bob introduced the founder. 2024-12-10: SolarGrid hit 1M homes powered.',
+    chunks: [
+      { chunk_index: 0, chunk_text: 'SolarGrid builds distributed solar micro-grids for rural electrification. Bob Martinez board member. Operating in 12 African countries.', chunk_source: 'compiled_truth', embedding: topicEmbedding({[T.CLIMATE]: 0.8, [T.ENTERPRISE]: 0.3}), token_count: 22 },
+      { chunk_index: 1, chunk_text: '2024-08-05: Bob introduced founder. 2024-12-10: SolarGrid hit 1M homes powered.', chunk_source: 'timeline', embedding: topicEmbedding({[T.CLIMATE]: 0.3, [T.ANNOUNCEMENT]: 0.5, [T.MEETING]: 0.4}), token_count: 14 },
+    ],
+  },
+
+  // ── Concepts (10) ────────────────────────────────────────────
+  {
+    slug: 'concepts/ai-first-companies',
+    type: 'concept', title: 'AI-First Companies',
+    compiled_truth: 'AI-first companies embed machine learning into the core product loop, not as a feature bolt-on. Examples: MindBridge (diagnostics), EduStack (adaptive learning), PixelCraft (design). The common pattern is that AI IS the product, not AI-enhanced.',
+    timeline: '2024-03-01: Wrote first draft of AI-first thesis. 2024-09-15: Revisited after seeing 10 more examples.',
+    chunks: [
+      { chunk_index: 0, chunk_text: 'AI-first companies embed machine learning into the core product loop. MindBridge, EduStack, PixelCraft. AI IS the product, not AI-enhanced.', chunk_source: 'compiled_truth', embedding: topicEmbedding({[T.AI]: 1, [T.FOUNDER]: 0.3, [T.ENTERPRISE]: 0.2, [T.CONSUMER]: 0.2}), token_count: 26 },
+      { chunk_index: 1, chunk_text: '2024-03-01: First draft of AI-first thesis. 2024-09-15: Revisited after 10 more examples.', chunk_source: 'timeline', embedding: topicEmbedding({[T.AI]: 0.5, [T.TIMELINE]: 0.5}), token_count: 18 },
+    ],
+  },
+  {
+    slug: 'concepts/climate-investing',
+    type: 'concept', title: 'Climate Tech Investment Thesis',
+    compiled_truth: 'Climate tech is a $50T market by 2040. Three waves: solar/wind (done), batteries/grid (now), carbon capture/fusion (next). TerraFund and Green Horizon are the key funds. Hard tech wins over software-only.',
+    timeline: '2024-04-10: Bob articulated the three-wave framework. 2024-11-15: James confirmed fusion timeline at Climate Week.',
+    chunks: [
+      { chunk_index: 0, chunk_text: 'Climate tech is a $50T market by 2040. Three waves: solar/wind (done), batteries/grid (now), carbon capture/fusion (next). TerraFund and Green Horizon key funds.', chunk_source: 'compiled_truth', embedding: topicEmbedding({[T.CLIMATE]: 1, [T.INVESTOR]: 0.5, [T.FUNDING]: 0.3}), token_count: 30 },
+      { chunk_index: 1, chunk_text: '2024-04-10: Bob three-wave framework. 2024-11-15: James confirmed fusion timeline at Climate Week.', chunk_source: 'timeline', embedding: topicEmbedding({[T.CLIMATE]: 0.5, [T.MEETING]: 0.5, [T.INVESTOR]: 0.3}), token_count: 18 },
+    ],
+  },
+  {
+    slug: 'concepts/fintech-rails',
+    type: 'concept', title: 'Payment Rails Infrastructure',
+    compiled_truth: 'Cross-border payments are still broken. SWIFT takes 3-5 days. NovaPay and similar startups are building real-time rails using local payment networks. Regulatory compliance is the moat, not technology.',
+    timeline: '2024-03-15: Alice explained regulatory-first approach at Fintech Forum.',
+    chunks: [
+      { chunk_index: 0, chunk_text: 'Cross-border payments are still broken. SWIFT takes 3-5 days. NovaPay building real-time rails. Regulatory compliance is the moat, not technology.', chunk_source: 'compiled_truth', embedding: topicEmbedding({[T.FINTECH]: 1, [T.ENTERPRISE]: 0.3}), token_count: 26 },
+      { chunk_index: 1, chunk_text: '2024-03-15: Alice explained regulatory-first approach at Fintech Forum.', chunk_source: 'timeline', embedding: topicEmbedding({[T.FINTECH]: 0.4, [T.MEETING]: 0.6}), token_count: 12 },
+    ],
+  },
+  {
+    slug: 'concepts/crypto-custody',
+    type: 'concept', title: 'Institutional Crypto Custody',
+    compiled_truth: 'Institutional adoption of crypto requires custody solutions that meet banking-grade security standards. MPC (multi-party computation) is the winning architecture. CryptoSafe is leading this space.',
+    timeline: '2024-01-20: Elena ETH Denver talk. 2024-10-30: First sovereign wealth fund using MPC custody.',
+    chunks: [
+      { chunk_index: 0, chunk_text: 'Institutional crypto adoption requires banking-grade custody. MPC is the winning architecture. CryptoSafe leads.', chunk_source: 'compiled_truth', embedding: topicEmbedding({[T.CRYPTO]: 0.9, [T.ENTERPRISE]: 0.5}), token_count: 18 },
+      { chunk_index: 1, chunk_text: '2024-01-20: Elena ETH Denver talk on MPC. 2024-10-30: First sovereign wealth fund using MPC custody.', chunk_source: 'timeline', embedding: topicEmbedding({[T.CRYPTO]: 0.5, [T.ANNOUNCEMENT]: 0.5, [T.MEETING]: 0.3}), token_count: 18 },
+    ],
+  },
+  {
+    slug: 'concepts/ai-health',
+    type: 'concept', title: 'AI in Healthcare',
+    compiled_truth: 'AI in healthcare is moving from research to deployment. MindBridge (mental health, 94% accuracy), GenomeAI (drug discovery, beat AlphaFold). FDA is creating new regulatory pathways for AI diagnostics.',
+    timeline: '2024-02-28: AI Health Summit. 2024-10-01: MindBridge FDA breakthrough designation.',
+    chunks: [
+      { chunk_index: 0, chunk_text: 'AI in healthcare moving from research to deployment. MindBridge 94% accuracy, GenomeAI beat AlphaFold. FDA creating new AI diagnostic pathways.', chunk_source: 'compiled_truth', embedding: topicEmbedding({[T.AI]: 0.7, [T.HEALTH]: 0.8, [T.BIOTECH]: 0.4}), token_count: 26 },
+      { chunk_index: 1, chunk_text: '2024-02-28: AI Health Summit. 2024-10-01: MindBridge FDA breakthrough.', chunk_source: 'timeline', embedding: topicEmbedding({[T.HEALTH]: 0.5, [T.ANNOUNCEMENT]: 0.5, [T.AI]: 0.3}), token_count: 12 },
+    ],
+  },
+  {
+    slug: 'concepts/robotics-warehouse',
+    type: 'concept', title: 'Warehouse Automation',
+    compiled_truth: 'Warehouse robotics is moving from structured (conveyor belts, AGVs) to unstructured (picking irregular objects). RoboLogic at 98% accuracy. The bottleneck is manipulation, not navigation.',
+    timeline: '2024-03-22: RoboLogic demo. 2024-11-01: Amazon deployment validates the market.',
+    chunks: [
+      { chunk_index: 0, chunk_text: 'Warehouse robotics moving from structured to unstructured picking. RoboLogic 98% accuracy. Bottleneck is manipulation, not navigation.', chunk_source: 'compiled_truth', embedding: topicEmbedding({[T.ROBOTICS]: 0.9, [T.AI]: 0.5, [T.ENTERPRISE]: 0.3}), token_count: 22 },
+      { chunk_index: 1, chunk_text: '2024-03-22: RoboLogic demo. 2024-11-01: Amazon deployment validates market.', chunk_source: 'timeline', embedding: topicEmbedding({[T.ROBOTICS]: 0.4, [T.LAUNCH]: 0.6}), token_count: 12 },
+    ],
+  },
+  {
+    slug: 'concepts/ai-education',
+    type: 'concept', title: 'AI in Education',
+    compiled_truth: 'Personalized education at scale is now possible with AI. EduStack shows 40% MoM growth. The key insight: adaptive curriculum beats static textbooks because every student learns differently.',
+    timeline: '2024-05-02: David demo day. 2024-12-01: EduStack expanded to 3 African countries.',
+    chunks: [
+      { chunk_index: 0, chunk_text: 'Personalized education at scale with AI. EduStack 40% MoM growth. Adaptive curriculum beats static textbooks.', chunk_source: 'compiled_truth', embedding: topicEmbedding({[T.AI]: 0.5, [T.EDUCATION]: 0.9, [T.CONSUMER]: 0.3}), token_count: 20 },
+      { chunk_index: 1, chunk_text: '2024-05-02: David demo. 2024-12-01: EduStack to Kenya and Ghana.', chunk_source: 'timeline', embedding: topicEmbedding({[T.EDUCATION]: 0.4, [T.LAUNCH]: 0.5}), token_count: 12 },
+    ],
+  },
+  {
+    slug: 'concepts/design-ai',
+    type: 'concept', title: 'AI-Powered Design Tools',
+    compiled_truth: 'AI is replacing the mockup-to-code pipeline. PixelCraft generates working components from descriptions. Grace Lee argues designers should think in systems, not screens. The next Figma is AI-native.',
+    timeline: '2024-04-30: PixelCraft beta launch validated the thesis.',
+    chunks: [
+      { chunk_index: 0, chunk_text: 'AI replacing mockup-to-code pipeline. PixelCraft generates components from descriptions. Grace Lee: think in systems, not screens. Next Figma is AI-native.', chunk_source: 'compiled_truth', embedding: topicEmbedding({[T.AI]: 0.6, [T.DESIGNER]: 0.9, [T.CONSUMER]: 0.3}), token_count: 28 },
+      { chunk_index: 1, chunk_text: '2024-04-30: PixelCraft beta validated the thesis.', chunk_source: 'timeline', embedding: topicEmbedding({[T.DESIGNER]: 0.3, [T.LAUNCH]: 0.5}), token_count: 10 },
+    ],
+  },
+  {
+    slug: 'concepts/acquisitions-2024',
+    type: 'concept', title: '2024 Notable Acquisitions',
+    compiled_truth: 'Datadog acquired CloudScale for $2.1B (serverless infrastructure). Signaling: infrastructure consolidation is accelerating. Platform companies are buying specialized tools.',
+    timeline: '2024-09-03: CloudScale acquisition announced. 2024-09-10: Market reacted positively, Datadog stock up 8%.',
+    chunks: [
+      { chunk_index: 0, chunk_text: 'Datadog acquired CloudScale for $2.1B. Infrastructure consolidation accelerating. Platform companies buying specialized tools.', chunk_source: 'compiled_truth', embedding: topicEmbedding({[T.ENTERPRISE]: 0.7, [T.ANNOUNCEMENT]: 0.5}), token_count: 20 },
+      { chunk_index: 1, chunk_text: '2024-09-03: CloudScale acquisition. 2024-09-10: Datadog stock up 8%.', chunk_source: 'timeline', embedding: topicEmbedding({[T.ENTERPRISE]: 0.3, [T.ANNOUNCEMENT]: 0.7}), token_count: 12 },
     ],
   },
 ];
+
+// ─── Benchmark Queries (20) ──────────────────────────────────────
 
 interface BenchmarkQuery {
   id: string;
   query: string;
   queryEmbedding: Float32Array;
   relevant: string[];
+  grades?: Record<string, number>;
   expectedSource: 'compiled_truth' | 'timeline';
   description: string;
 }
 
 const QUERIES: BenchmarkQuery[] = [
-  {
-    id: 'entity-lookup',
-    query: 'What does Variant do?',
-    queryEmbedding: blendEmbedding(2, 11, 0.9),
-    relevant: ['companies/variant'],
-    expectedSource: 'compiled_truth',
-    description: 'Entity lookup should surface compiled truth',
-  },
-  {
-    id: 'person-lookup',
-    query: 'Who is Pedro?',
-    queryEmbedding: blendEmbedding(0, 10, 0.9),
-    relevant: ['people/pedro'],
-    expectedSource: 'compiled_truth',
-    description: 'Person lookup should surface compiled truth',
-  },
-  {
-    id: 'meeting-query',
-    query: 'When did we last meet Pedro?',
-    queryEmbedding: blendEmbedding(1, 10, 0.9),
-    relevant: ['people/pedro'],
-    expectedSource: 'timeline',
-    description: 'Temporal query should surface timeline',
-  },
-  {
-    id: 'topic-query',
-    query: 'AI changes who gets to build',
-    queryEmbedding: blendEmbedding(4, 12, 0.9),
-    relevant: ['concepts/ai-philosophy'],
-    expectedSource: 'compiled_truth',
-    description: 'Topic query should surface compiled truth',
-  },
-  {
-    id: 'cross-entity',
-    query: 'Jesse Walden Variant',
-    queryEmbedding: blendEmbedding(6, 2, 0.5),
-    relevant: ['people/jesse', 'companies/variant'],
-    expectedSource: 'compiled_truth',
-    description: 'Cross-entity query should surface compiled truth from both',
-  },
-  {
-    id: 'event-query',
-    query: 'Variant new fund announcement',
-    queryEmbedding: blendEmbedding(3, 11, 0.9),
-    relevant: ['companies/variant'],
-    expectedSource: 'timeline',
-    description: 'Event query should surface timeline',
-  },
-  {
-    id: 'company-overview',
-    query: 'Brex fintech corporate cards',
-    queryEmbedding: blendEmbedding(8, 14, 0.9),
-    relevant: ['companies/brex'],
-    expectedSource: 'compiled_truth',
-    description: 'Company overview should surface compiled truth',
-  },
-  {
-    id: 'negative-control',
-    query: 'quantum computing advances',
-    queryEmbedding: basisEmbedding(500),
-    relevant: [],
-    expectedSource: 'compiled_truth',
-    description: 'Irrelevant query should return no relevant results',
-  },
+  // Entity lookups (should get compiled truth)
+  { id: 'q01', query: 'Who is Alice Chen?', queryEmbedding: topicEmbedding({[T.FINTECH]: 0.8, [T.FOUNDER]: 0.5}), relevant: ['people/alice-chen', 'companies/novapay'], grades: {'people/alice-chen': 3, 'companies/novapay': 1}, expectedSource: 'compiled_truth', description: 'Person lookup: Alice Chen' },
+  { id: 'q02', query: 'What does MindBridge do?', queryEmbedding: topicEmbedding({[T.AI]: 0.5, [T.HEALTH]: 0.8}), relevant: ['companies/mindbridge', 'people/carol-nakamura', 'concepts/ai-health'], grades: {'companies/mindbridge': 3, 'people/carol-nakamura': 2, 'concepts/ai-health': 1}, expectedSource: 'compiled_truth', description: 'Company lookup: MindBridge' },
+  { id: 'q03', query: 'Tell me about climate tech investing', queryEmbedding: topicEmbedding({[T.CLIMATE]: 0.9, [T.INVESTOR]: 0.5}), relevant: ['concepts/climate-investing', 'people/bob-martinez', 'people/james-park', 'companies/terrafund'], grades: {'concepts/climate-investing': 3, 'people/james-park': 2, 'people/bob-martinez': 2, 'companies/terrafund': 1}, expectedSource: 'compiled_truth', description: 'Topic overview: climate investing' },
+
+  // Temporal queries (should get timeline)
+  { id: 'q04', query: 'When did we last meet Alice?', queryEmbedding: topicEmbedding({[T.FINTECH]: 0.4, [T.MEETING]: 0.9}), relevant: ['people/alice-chen'], expectedSource: 'timeline', description: 'Temporal: last meeting with Alice' },
+  { id: 'q05', query: 'Recent updates on GenomeAI', queryEmbedding: topicEmbedding({[T.BIOTECH]: 0.6, [T.ANNOUNCEMENT]: 0.5}), relevant: ['companies/genomeai', 'people/hiro-tanaka'], grades: {'companies/genomeai': 3, 'people/hiro-tanaka': 1}, expectedSource: 'timeline', description: 'Temporal: GenomeAI updates' },
+  { id: 'q06', query: 'What happened with the CloudScale acquisition?', queryEmbedding: topicEmbedding({[T.ENTERPRISE]: 0.6, [T.ANNOUNCEMENT]: 0.8}), relevant: ['companies/cloudscale', 'concepts/acquisitions-2024', 'people/iris-washington'], grades: {'companies/cloudscale': 3, 'concepts/acquisitions-2024': 2, 'people/iris-washington': 1}, expectedSource: 'timeline', description: 'Event: CloudScale acquisition' },
+
+  // Cross-entity queries (tests relationship understanding)
+  { id: 'q07', query: 'Alice Chen NovaPay cross-border payments', queryEmbedding: topicEmbedding({[T.FINTECH]: 0.9, [T.FOUNDER]: 0.3}), relevant: ['people/alice-chen', 'companies/novapay', 'concepts/fintech-rails'], grades: {'people/alice-chen': 2, 'companies/novapay': 3, 'concepts/fintech-rails': 2}, expectedSource: 'compiled_truth', description: 'Cross-entity: Alice + NovaPay' },
+  { id: 'q08', query: 'Carol Nakamura MindBridge AI health', queryEmbedding: topicEmbedding({[T.AI]: 0.5, [T.HEALTH]: 0.7, [T.FOUNDER]: 0.3}), relevant: ['people/carol-nakamura', 'companies/mindbridge', 'concepts/ai-health'], grades: {'people/carol-nakamura': 2, 'companies/mindbridge': 2, 'concepts/ai-health': 2}, expectedSource: 'compiled_truth', description: 'Cross-entity: Carol + MindBridge' },
+
+  // Competitive/thematic queries (multiple relevant pages)
+  { id: 'q09', query: 'AI companies building real products', queryEmbedding: topicEmbedding({[T.AI]: 0.9, [T.FOUNDER]: 0.3, [T.CONSUMER]: 0.2}), relevant: ['concepts/ai-first-companies', 'companies/mindbridge', 'companies/edustack', 'companies/pixelcraft', 'companies/genomeai'], grades: {'concepts/ai-first-companies': 3, 'companies/mindbridge': 2, 'companies/edustack': 2, 'companies/pixelcraft': 2, 'companies/genomeai': 2}, expectedSource: 'compiled_truth', description: 'Thematic: AI companies' },
+  { id: 'q10', query: 'Who raised funding recently?', queryEmbedding: topicEmbedding({[T.FUNDING]: 0.9, [T.ANNOUNCEMENT]: 0.4}), relevant: ['companies/novapay', 'companies/cryptosafe', 'companies/terrafund', 'people/carol-nakamura'], grades: {'companies/novapay': 2, 'companies/cryptosafe': 2, 'companies/terrafund': 2, 'people/carol-nakamura': 1}, expectedSource: 'timeline', description: 'Temporal: recent funding rounds' },
+
+  // Hard disambiguation queries
+  { id: 'q11', query: 'Bob and James climate investments', queryEmbedding: topicEmbedding({[T.CLIMATE]: 0.8, [T.INVESTOR]: 0.6}), relevant: ['people/bob-martinez', 'people/james-park', 'concepts/climate-investing', 'companies/terrafund'], grades: {'people/bob-martinez': 2, 'people/james-park': 2, 'concepts/climate-investing': 2, 'companies/terrafund': 1}, expectedSource: 'compiled_truth', description: 'Disambiguation: two climate investors' },
+  { id: 'q12', query: 'AI replacing designers', queryEmbedding: topicEmbedding({[T.AI]: 0.6, [T.DESIGNER]: 0.8}), relevant: ['concepts/design-ai', 'companies/pixelcraft', 'people/grace-lee'], grades: {'concepts/design-ai': 3, 'companies/pixelcraft': 2, 'people/grace-lee': 2}, expectedSource: 'compiled_truth', description: 'Topic: AI and design' },
+
+  // Full context requests
+  { id: 'q13', query: 'Give me everything on RoboLogic', queryEmbedding: topicEmbedding({[T.ROBOTICS]: 0.9, [T.AI]: 0.4}), relevant: ['companies/robologic', 'people/frank-dubois', 'concepts/robotics-warehouse'], grades: {'companies/robologic': 3, 'people/frank-dubois': 2, 'concepts/robotics-warehouse': 1}, expectedSource: 'timeline', description: 'Full context: RoboLogic' },
+  { id: 'q14', query: 'Deep dive on crypto custody', queryEmbedding: topicEmbedding({[T.CRYPTO]: 0.9, [T.ENTERPRISE]: 0.4}), relevant: ['concepts/crypto-custody', 'companies/cryptosafe', 'people/elena-volkov'], grades: {'concepts/crypto-custody': 3, 'companies/cryptosafe': 2, 'people/elena-volkov': 2}, expectedSource: 'timeline', description: 'Full context: crypto custody' },
+
+  // Tricky queries that test boost vs natural
+  { id: 'q15', query: 'Education technology Africa growth', queryEmbedding: topicEmbedding({[T.EDUCATION]: 0.8, [T.CONSUMER]: 0.3}), relevant: ['companies/edustack', 'people/david-okonkwo', 'concepts/ai-education'], grades: {'companies/edustack': 3, 'people/david-okonkwo': 2, 'concepts/ai-education': 2}, expectedSource: 'compiled_truth', description: 'Topic: edtech in Africa' },
+  { id: 'q16', query: 'What launched this year?', queryEmbedding: topicEmbedding({[T.LAUNCH]: 0.9, [T.ANNOUNCEMENT]: 0.4}), relevant: ['companies/novapay', 'companies/pixelcraft', 'companies/edustack', 'companies/robologic'], grades: {'companies/pixelcraft': 2, 'companies/edustack': 2, 'companies/novapay': 2, 'companies/robologic': 2}, expectedSource: 'timeline', description: 'Temporal: 2024 launches' },
+
+  // Narrow expert queries
+  { id: 'q17', query: 'MPC multi-party computation wallets', queryEmbedding: topicEmbedding({[T.CRYPTO]: 0.8, [T.ENGINEER]: 0.4}), relevant: ['people/elena-volkov', 'companies/cryptosafe', 'concepts/crypto-custody'], grades: {'people/elena-volkov': 3, 'companies/cryptosafe': 2, 'concepts/crypto-custody': 2}, expectedSource: 'compiled_truth', description: 'Expert: MPC wallets' },
+  { id: 'q18', query: 'Protein folding drug discovery LLMs', queryEmbedding: topicEmbedding({[T.AI]: 0.6, [T.BIOTECH]: 0.9}), relevant: ['companies/genomeai', 'people/hiro-tanaka', 'concepts/ai-health'], grades: {'companies/genomeai': 3, 'people/hiro-tanaka': 2, 'concepts/ai-health': 1}, expectedSource: 'compiled_truth', description: 'Expert: protein folding AI' },
+
+  // Negative control
+  { id: 'q19', query: 'quantum computing error correction', queryEmbedding: topicEmbedding({100: 1}), relevant: [], expectedSource: 'compiled_truth', description: 'Negative: no relevant pages' },
+
+  // Ambiguous query (could be entity OR temporal)
+  { id: 'q20', query: 'EduStack Nigeria', queryEmbedding: topicEmbedding({[T.EDUCATION]: 0.7, [T.CONSUMER]: 0.3}), relevant: ['companies/edustack', 'people/david-okonkwo'], grades: {'companies/edustack': 3, 'people/david-okonkwo': 1}, expectedSource: 'compiled_truth', description: 'Ambiguous: EduStack in Nigeria' },
 ];
 
 // ─── Benchmark Runner ────────────────────────────────────────────
@@ -186,153 +430,100 @@ interface RunResult {
   topSource: 'compiled_truth' | 'timeline' | 'none';
   topSlug: string;
   precision1: number;
-  mrr: number;
+  precision5: number;
+  recall5: number;
+  mrrScore: number;
   ndcg5: number;
   sourceCorrect: boolean;
 }
 
-async function runBenchmark(
-  engine: PGLiteEngine,
-  queries: BenchmarkQuery[],
-  withBoost: boolean,
-): Promise<RunResult[]> {
+async function runBenchmark(engine: PGLiteEngine, queries: BenchmarkQuery[], withBoost: boolean): Promise<RunResult[]> {
   const results: RunResult[] = [];
-
   for (const q of queries) {
-    // Get keyword results
-    const keywordResults = await engine.searchKeyword(q.query, { limit: 20 });
-
-    // Get vector results
-    const vectorResults = await engine.searchVector(q.queryEmbedding, { limit: 20 });
-
-    // Run RRF fusion (with or without boost via the exported function)
-    let fused: SearchResult[];
-    if (withBoost) {
-      // rrfFusion includes normalization + boost
-      fused = rrfFusion([vectorResults, keywordResults], RRF_K);
-    } else {
-      // Simulate old behavior: RRF without normalization/boost
-      fused = rrfFusionBaseline([vectorResults, keywordResults]);
-    }
-
-    // Dedup
+    const kw = await engine.searchKeyword(q.query, { limit: 20 });
+    const vec = await engine.searchVector(q.queryEmbedding, { limit: 20 });
+    const fused = withBoost ? rrfFusion([vec, kw], RRF_K) : rrfFusionBaseline([vec, kw]);
     const deduped = dedupResults(fused);
-    const top5 = deduped.slice(0, 5);
-
-    const relevantSet = new Set(q.relevant);
-    const gradesMap = new Map(q.relevant.map(s => [s, 1]));
-    const hitSlugs = top5.map(r => r.slug);
-
+    const top = deduped.slice(0, 10);
+    const slugs = top.map(r => r.slug);
+    const rel = new Set(q.relevant);
+    const grades = new Map(Object.entries(q.grades ?? Object.fromEntries(q.relevant.map(s => [s, 1]))));
     results.push({
-      queryId: q.id,
-      hits: top5,
-      topSource: top5.length > 0 ? top5[0].chunk_source : 'none',
-      topSlug: top5.length > 0 ? top5[0].slug : '',
-      precision1: precisionAtK(hitSlugs, relevantSet, 1),
-      mrr: mrr(hitSlugs, relevantSet),
-      ndcg5: ndcgAtK(hitSlugs, gradesMap, 5),
-      sourceCorrect: top5.length > 0 ? top5[0].chunk_source === q.expectedSource : q.relevant.length === 0,
+      queryId: q.id, hits: top,
+      topSource: top.length > 0 ? top[0].chunk_source : 'none',
+      topSlug: top.length > 0 ? top[0].slug : '',
+      precision1: precisionAtK(slugs, rel, 1),
+      precision5: precisionAtK(slugs, rel, 5),
+      recall5: recallAtK(slugs, rel, 5),
+      mrrScore: mrr(slugs, rel),
+      ndcg5: ndcgAtK(slugs, grades, 5),
+      sourceCorrect: top.length > 0 ? top[0].chunk_source === q.expectedSource : q.relevant.length === 0,
     });
   }
-
   return results;
 }
 
-// Baseline RRF without normalization or boost (simulates pre-PR#64 behavior)
+async function runBenchmarkWithIntent(engine: PGLiteEngine, queries: BenchmarkQuery[]): Promise<RunResult[]> {
+  const results: RunResult[] = [];
+  for (const q of queries) {
+    const detail = autoDetectDetail(q.query);
+    const applyBoost = detail !== 'high';
+    const kw = await engine.searchKeyword(q.query, { limit: 20, detail });
+    const vec = await engine.searchVector(q.queryEmbedding, { limit: 20, detail });
+    const fused = rrfFusion([vec, kw], RRF_K, applyBoost);
+    const deduped = dedupResults(fused);
+    const top = deduped.slice(0, 10);
+    const slugs = top.map(r => r.slug);
+    const rel = new Set(q.relevant);
+    const grades = new Map(Object.entries(q.grades ?? Object.fromEntries(q.relevant.map(s => [s, 1]))));
+    results.push({
+      queryId: q.id, hits: top,
+      topSource: top.length > 0 ? top[0].chunk_source : 'none',
+      topSlug: top.length > 0 ? top[0].slug : '',
+      precision1: precisionAtK(slugs, rel, 1),
+      precision5: precisionAtK(slugs, rel, 5),
+      recall5: recallAtK(slugs, rel, 5),
+      mrrScore: mrr(slugs, rel),
+      ndcg5: ndcgAtK(slugs, grades, 5),
+      sourceCorrect: top.length > 0 ? top[0].chunk_source === q.expectedSource : q.relevant.length === 0,
+    });
+  }
+  return results;
+}
+
 function rrfFusionBaseline(lists: SearchResult[][]): SearchResult[] {
   const scores = new Map<string, { result: SearchResult; score: number }>();
-
   for (const list of lists) {
     for (let rank = 0; rank < list.length; rank++) {
       const r = list[rank];
       const key = `${r.slug}:${r.chunk_text.slice(0, 50)}`;
       const existing = scores.get(key);
-      const rrfScore = 1 / (RRF_K + rank);
-
-      if (existing) {
-        existing.score += rrfScore;
-      } else {
-        scores.set(key, { result: r, score: rrfScore });
-      }
+      const s = 1 / (RRF_K + rank);
+      if (existing) existing.score += s;
+      else scores.set(key, { result: r, score: s });
     }
   }
-
-  return Array.from(scores.values())
-    .sort((a, b) => b.score - a.score)
-    .map(({ result, score }) => ({ ...result, score }));
-}
-
-// Intent-aware benchmark: uses the classifier to set detail per query
-// and skips boost for detail=high (temporal/event queries)
-async function runBenchmarkWithIntent(
-  engine: PGLiteEngine,
-  queries: BenchmarkQuery[],
-): Promise<RunResult[]> {
-  const results: RunResult[] = [];
-
-  for (const q of queries) {
-    const detail = autoDetectDetail(q.query);
-    const applyBoost = detail !== 'high';
-
-    // Get keyword results with detail filter
-    const keywordResults = await engine.searchKeyword(q.query, { limit: 20, detail });
-
-    // Get vector results with detail filter
-    const vectorResults = await engine.searchVector(q.queryEmbedding, { limit: 20, detail });
-
-    // RRF with conditional boost (skip for temporal/event queries)
-    let fused = rrfFusion([vectorResults, keywordResults], RRF_K, applyBoost);
-
-    // Dedup
-    const deduped = dedupResults(fused);
-    const top5 = deduped.slice(0, 5);
-
-    const relevantSet = new Set(q.relevant);
-    const gradesMap = new Map(q.relevant.map(s => [s, 1]));
-    const hitSlugs = top5.map(r => r.slug);
-
-    results.push({
-      queryId: q.id,
-      hits: top5,
-      topSource: top5.length > 0 ? top5[0].chunk_source : 'none',
-      topSlug: top5.length > 0 ? top5[0].slug : '',
-      precision1: precisionAtK(hitSlugs, relevantSet, 1),
-      mrr: mrr(hitSlugs, relevantSet),
-      ndcg5: ndcgAtK(hitSlugs, gradesMap, 5),
-      sourceCorrect: top5.length > 0 ? top5[0].chunk_source === q.expectedSource : q.relevant.length === 0,
-    });
-  }
-
-  return results;
+  return Array.from(scores.values()).sort((a, b) => b.score - a.score).map(({ result, score }) => ({ ...result, score }));
 }
 
 // ─── Output ──────────────────────────────────────────────────────
 
-function formatResults(label: string, results: RunResult[]): string {
-  const lines: string[] = [];
-  lines.push(`### ${label}`);
-  lines.push('');
-  lines.push('| Query | P@1 | MRR | nDCG@5 | Top Source | Source Correct | Top Slug |');
-  lines.push('|-------|-----|-----|--------|------------|----------------|----------|');
+function means(results: RunResult[], queries: BenchmarkQuery[]) {
+  const v = results.filter(r => queries.find(q => q.id === r.queryId)!.relevant.length > 0);
+  return {
+    p1: v.reduce((s, r) => s + r.precision1, 0) / v.length,
+    p5: v.reduce((s, r) => s + r.precision5, 0) / v.length,
+    r5: v.reduce((s, r) => s + r.recall5, 0) / v.length,
+    mrr: v.reduce((s, r) => s + r.mrrScore, 0) / v.length,
+    ndcg: v.reduce((s, r) => s + r.ndcg5, 0) / v.length,
+    src: v.filter(r => r.sourceCorrect).length / v.length,
+    n: v.length,
+  };
+}
 
-  for (const r of results) {
-    const q = QUERIES.find(q => q.id === r.queryId)!;
-    lines.push(
-      `| ${q.description.slice(0, 50)} | ${r.precision1.toFixed(2)} | ${r.mrr.toFixed(2)} | ${r.ndcg5.toFixed(2)} | ${r.topSource} | ${r.sourceCorrect ? 'YES' : 'NO'} | ${r.topSlug || '(none)'} |`
-    );
-  }
-
-  // Means
-  const validResults = results.filter(r => QUERIES.find(q => q.id === r.queryId)!.relevant.length > 0);
-  const meanP1 = validResults.reduce((s, r) => s + r.precision1, 0) / validResults.length;
-  const meanMRR = validResults.reduce((s, r) => s + r.mrr, 0) / validResults.length;
-  const meanNDCG = validResults.reduce((s, r) => s + r.ndcg5, 0) / validResults.length;
-  const sourceAccuracy = validResults.filter(r => r.sourceCorrect).length / validResults.length;
-
-  lines.push('');
-  lines.push(`**Mean P@1:** ${meanP1.toFixed(3)} | **Mean MRR:** ${meanMRR.toFixed(3)} | **Mean nDCG@5:** ${meanNDCG.toFixed(3)} | **Source Accuracy:** ${(sourceAccuracy * 100).toFixed(1)}%`);
-
-  return lines.join('\n');
+function delta(a: number, b: number): string {
+  const d = a - b;
+  return `${d >= 0 ? '+' : ''}${d.toFixed(3)}`;
 }
 
 // ─── Main ────────────────────────────────────────────────────────
@@ -342,137 +533,80 @@ async function main() {
   await engine.connect({});
   await engine.initSchema();
 
-  // Seed pages
   for (const page of PAGES) {
-    await engine.putPage(page.slug, {
-      type: page.type,
-      title: page.title,
-      compiled_truth: page.compiled_truth,
-      timeline: page.timeline,
-    });
+    await engine.putPage(page.slug, { type: page.type, title: page.title, compiled_truth: page.compiled_truth, timeline: page.timeline });
     await engine.upsertChunks(page.slug, page.chunks);
   }
 
   console.log(`Seeded ${PAGES.length} pages, ${PAGES.reduce((s, p) => s + p.chunks.length, 0)} chunks`);
-  console.log(`Running ${QUERIES.length} queries...\n`);
+  console.log(`Running ${QUERIES.length} queries x 3 configurations...\n`);
 
-  // Run baseline (no boost)
   const baseline = await runBenchmark(engine, QUERIES, false);
-
-  // Run boosted (PR #64)
   const boosted = await runBenchmark(engine, QUERIES, true);
-
-  // Run with intent classifier (PR #64 + auto-detail)
   const withIntent = await runBenchmarkWithIntent(engine, QUERIES);
 
-  // Show intent classifications
-  console.log('Intent classifications:');
-  for (const q of QUERIES) {
-    const detail = autoDetectDetail(q.query);
-    console.log(`  "${q.query}" → detail=${detail ?? 'medium (default)'}`);
-  }
-  console.log('');
+  const bm = means(baseline, QUERIES);
+  const am = means(boosted, QUERIES);
+  const im = means(withIntent, QUERIES);
 
-  // Generate markdown
   const date = new Date().toISOString().split('T')[0];
   const md: string[] = [];
 
   md.push(`# Search Quality Benchmark: ${date}`);
   md.push('');
-  md.push('## PR #64 Impact Analysis');
+  md.push(`## Overview`);
   md.push('');
-  md.push('Three-way comparison: baseline (no boost) vs PR#64 (boost only) vs PR#64 + intent');
-  md.push('classifier (auto-selects detail level per query). Measured against 5 seeded brain');
-  md.push('pages with 10 chunks total, using 8 benchmark queries with structured mock embeddings.');
+  md.push(`- **${PAGES.length} pages** (${PAGES.filter(p => p.type === 'person').length} people, ${PAGES.filter(p => p.type === 'company').length} companies, ${PAGES.filter(p => p.type === 'concept').length} concepts)`);
+  md.push(`- **${PAGES.reduce((s, p) => s + p.chunks.length, 0)} chunks** with overlapping semantic embeddings`);
+  md.push(`- **${QUERIES.length} queries** with graded relevance (1-3 grades, multiple relevant pages)`);
+  md.push(`- **3 configurations:** baseline, boost only, boost + intent classifier`);
+  md.push('');
+  md.push('All data is fictional. No private information. Embeddings use shared topic dimensions');
+  md.push('to simulate real semantic overlap (e.g., "AI" appears in health, education, design, robotics).');
   md.push('');
   md.push('Inspired by [Ramp Labs\' "Latent Briefing" paper](https://ramp.com) (April 2026).');
   md.push('');
 
-  md.push('## Intent Classifications');
+  md.push('## Summary Results');
   md.push('');
-  md.push('| Query | Detected Intent | Detail Level |');
-  md.push('|-------|----------------|-------------|');
-  for (const q of QUERIES) {
-    const detail = autoDetectDetail(q.query);
-    md.push(`| ${q.query} | ${detail ? (detail === 'low' ? 'entity' : detail === 'high' ? 'temporal/event' : 'general') : 'general'} | ${detail ?? 'medium'} |`);
-  }
-  md.push('');
-
-  md.push('## Results');
-  md.push('');
-  md.push(formatResults('A. Baseline (pre-PR#64, no boost)', baseline));
-  md.push('');
-  md.push(formatResults('B. PR #64 (compiled truth boost only)', boosted));
-  md.push('');
-  md.push(formatResults('C. PR #64 + Intent Classifier (auto-detail)', withIntent));
+  md.push('| Metric | A. Baseline | B. Boost Only | C. Boost + Intent | B vs A | C vs A |');
+  md.push('|--------|-------------|---------------|-------------------|--------|--------|');
+  md.push(`| P@1 | ${bm.p1.toFixed(3)} | ${am.p1.toFixed(3)} | ${im.p1.toFixed(3)} | ${delta(am.p1, bm.p1)} | ${delta(im.p1, bm.p1)} |`);
+  md.push(`| P@5 | ${bm.p5.toFixed(3)} | ${am.p5.toFixed(3)} | ${im.p5.toFixed(3)} | ${delta(am.p5, bm.p5)} | ${delta(im.p5, bm.p5)} |`);
+  md.push(`| Recall@5 | ${bm.r5.toFixed(3)} | ${am.r5.toFixed(3)} | ${im.r5.toFixed(3)} | ${delta(am.r5, bm.r5)} | ${delta(im.r5, bm.r5)} |`);
+  md.push(`| MRR | ${bm.mrr.toFixed(3)} | ${am.mrr.toFixed(3)} | ${im.mrr.toFixed(3)} | ${delta(am.mrr, bm.mrr)} | ${delta(im.mrr, bm.mrr)} |`);
+  md.push(`| nDCG@5 | ${bm.ndcg.toFixed(3)} | ${am.ndcg.toFixed(3)} | ${im.ndcg.toFixed(3)} | ${delta(am.ndcg, bm.ndcg)} | ${delta(im.ndcg, bm.ndcg)} |`);
+  md.push(`| Source Accuracy | ${(bm.src*100).toFixed(1)}% | ${(am.src*100).toFixed(1)}% | ${(im.src*100).toFixed(1)}% | ${((am.src-bm.src)*100).toFixed(1)}pp | ${((im.src-bm.src)*100).toFixed(1)}pp |`);
   md.push('');
 
-  // Helper to compute means
-  function computeMeans(results: RunResult[]) {
-    const valid = results.filter(r => QUERIES.find(q => q.id === r.queryId)!.relevant.length > 0);
-    return {
-      p1: valid.reduce((s, r) => s + r.precision1, 0) / valid.length,
-      mrr: valid.reduce((s, r) => s + r.mrr, 0) / valid.length,
-      ndcg: valid.reduce((s, r) => s + r.ndcg5, 0) / valid.length,
-      src: valid.filter(r => r.sourceCorrect).length / valid.length,
-    };
-  }
-
-  const bm = computeMeans(baseline);
-  const am = computeMeans(boosted);
-  const im = computeMeans(withIntent);
-
-  md.push('## Delta Analysis');
+  // Per-query breakdown
+  md.push('## Per-Query Results');
   md.push('');
-  md.push('| Metric | Baseline | Boost Only | + Intent | B vs A | C vs A |');
-  md.push('|--------|----------|------------|----------|--------|--------|');
-  md.push(`| Mean P@1 | ${bm.p1.toFixed(3)} | ${am.p1.toFixed(3)} | ${im.p1.toFixed(3)} | ${(am.p1 - bm.p1) >= 0 ? '+' : ''}${(am.p1 - bm.p1).toFixed(3)} | ${(im.p1 - bm.p1) >= 0 ? '+' : ''}${(im.p1 - bm.p1).toFixed(3)} |`);
-  md.push(`| Mean MRR | ${bm.mrr.toFixed(3)} | ${am.mrr.toFixed(3)} | ${im.mrr.toFixed(3)} | ${(am.mrr - bm.mrr) >= 0 ? '+' : ''}${(am.mrr - bm.mrr).toFixed(3)} | ${(im.mrr - bm.mrr) >= 0 ? '+' : ''}${(im.mrr - bm.mrr).toFixed(3)} |`);
-  md.push(`| Mean nDCG@5 | ${bm.ndcg.toFixed(3)} | ${am.ndcg.toFixed(3)} | ${im.ndcg.toFixed(3)} | ${(am.ndcg - bm.ndcg) >= 0 ? '+' : ''}${(am.ndcg - bm.ndcg).toFixed(3)} | ${(im.ndcg - bm.ndcg) >= 0 ? '+' : ''}${(im.ndcg - bm.ndcg).toFixed(3)} |`);
-  md.push(`| Source Accuracy | ${(bm.src * 100).toFixed(1)}% | ${(am.src * 100).toFixed(1)}% | ${(im.src * 100).toFixed(1)}% | ${((am.src - bm.src) * 100) >= 0 ? '+' : ''}${((am.src - bm.src) * 100).toFixed(1)}pp | ${((im.src - bm.src) * 100) >= 0 ? '+' : ''}${((im.src - bm.src) * 100).toFixed(1)}pp |`);
-  md.push('');
-
-  // Per-query delta
-  md.push('## Per-Query Comparison');
-  md.push('');
-  md.push('| Query | Detail | Base Src | Boost Src | Intent Src | Expected | Winner |');
-  md.push('|-------|--------|----------|-----------|------------|----------|--------|');
+  md.push('| # | Query | Relevant | Detail | Base P@1 | Boost P@1 | Intent P@1 | Base Src | Intent Src | Expected |');
+  md.push('|---|-------|----------|--------|----------|-----------|------------|----------|------------|----------|');
   for (let i = 0; i < QUERIES.length; i++) {
     const q = QUERIES[i];
-    if (q.relevant.length === 0) continue;
-    const b = baseline[i];
-    const a = boosted[i];
-    const c = withIntent[i];
-    const detail = autoDetectDetail(q.query) ?? 'medium';
-    const winner = c.sourceCorrect ? 'Intent' : a.sourceCorrect ? 'Boost' : b.sourceCorrect ? 'Base' : 'None';
-    md.push(`| ${q.description.slice(0, 40)} | ${detail} | ${b.topSource.slice(0, 8)} | ${a.topSource.slice(0, 8)} | ${c.topSource.slice(0, 8)} | ${q.expectedSource.slice(0, 8)} | ${winner} |`);
+    const b = baseline[i], a = boosted[i], c = withIntent[i];
+    const detail = autoDetectDetail(q.query) ?? 'med';
+    md.push(`| ${q.id} | ${q.description.slice(0, 35)} | ${q.relevant.length} | ${detail.slice(0,3)} | ${b.precision1.toFixed(2)} | ${a.precision1.toFixed(2)} | ${c.precision1.toFixed(2)} | ${b.topSource.slice(0,4)} | ${c.topSource.slice(0,4)} | ${q.expectedSource.slice(0,4)} |`);
   }
   md.push('');
 
   md.push('## Methodology');
   md.push('');
-  md.push('- **Engine:** PGLite (in-memory, Postgres 17.5 via WASM)');
-  md.push('- **Pages:** 5 test pages (2 person, 2 company, 1 concept) with 2 chunks each');
-  md.push('- **Embeddings:** Structured basis vectors with blending (deterministic cosine distances)');
-  md.push('- **Queries:** 7 with ground truth + 1 negative control');
-  md.push('- **Baseline:** Standard RRF fusion (K=60), no normalization, no source boost');
-  md.push('- **PR #64:** RRF normalized to 0-1, 2.0x compiled_truth boost, source-aware dedup');
-  md.push('- **Metrics:** P@1 (precision at rank 1), MRR (mean reciprocal rank), nDCG@5, source accuracy');
-  md.push('');
-  md.push('## What Changed in PR #64');
-  md.push('');
-  md.push('1. **RRF normalization** — scores normalized to 0-1 before boosting');
-  md.push('2. **Compiled truth boost** — 2.0x multiplier for compiled_truth chunks');
-  md.push('3. **Source-aware dedup** — guarantees compiled truth chunk per page in results');
-  md.push('4. **Cosine re-scoring** — blends RRF + cosine similarity (0.7/0.3) before dedup');
-  md.push('5. **Detail parameter** — `--detail low/medium/high` controls timeline inclusion');
-  md.push('6. **CJK word count** — fixes query expansion for Chinese/Japanese/Korean');
-  md.push('7. **Eval harness** — `gbrain eval` with P@k, R@k, MRR, nDCG@k + A/B comparison');
+  md.push('- **Engine:** PGLite (in-memory Postgres 17.5 via WASM)');
+  md.push('- **Embeddings:** Normalized topic vectors with shared dimensions (25 topic axes)');
+  md.push('- **Overlap:** Multiple pages share topics (e.g., 5 pages relevant for "AI companies")');
+  md.push('- **Graded relevance:** 1-3 grades per query (3 = primary, 1 = tangentially relevant)');
+  md.push('- **Metrics:** P@1, P@5, Recall@5, MRR, nDCG@5, Source Accuracy');
+  md.push('- **Configurations:**');
+  md.push('  - A. Baseline: RRF K=60, no normalization, no boost, text-prefix dedup key');
+  md.push('  - B. Boost: RRF normalized to 0-1, 2.0x compiled_truth boost, chunk_id dedup key');
+  md.push('  - C. Intent: B + heuristic intent classifier auto-selects detail level, skips boost for temporal/event queries');
 
   const output = md.join('\n');
   console.log(output);
 
-  // Write to file
   const fs = require('fs');
   fs.mkdirSync('docs/benchmarks', { recursive: true });
   fs.writeFileSync(`docs/benchmarks/${date}.md`, output);
