@@ -630,9 +630,8 @@ export class PostgresEngine implements BrainEngine {
          WHERE NOT EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = p.id)
            AND NOT EXISTS (SELECT 1 FROM links l WHERE l.from_page_id = p.id)
         ) as orphan_pages,
-        (SELECT count(*) FROM content_chunks cc
-         JOIN pages p ON p.id = cc.page_id
-         WHERE p.compiled_truth = '' AND p.timeline = ''
+        (SELECT count(*) FROM links l
+         WHERE NOT EXISTS (SELECT 1 FROM pages p WHERE p.id = l.to_page_id)
         ) as dead_links,
         (SELECT count(*) FROM content_chunks WHERE embedded_at IS NULL) as missing_embeddings
     `;
