@@ -165,8 +165,10 @@ export const xHandleToTweetResolver: Resolver<XHandleToTweetInput, XHandleToTwee
       }
 
       if (resp.status === 429 && attempt < MAX_RETRIES_ON_429) {
-        const retryAfterSec = parseInt(resp.headers.get('retry-after') || '2', 10) || 2;
-        const waitMs = Math.min(30_000, retryAfterSec * 1000);
+        // X API honors both `Retry-After` (RFC; seconds) AND its own
+        // `x-rate-limit-reset` (epoch seconds). Take whichever gives us a
+        // longer wait — hitting the reset window early just earns another 429.
+        const waitMs = computeBackoffMs(resp);
         ctx.logger.warn('x_handle_to_tweet: 429, backing off', { handle, waitMs, attempt });
         await sleep(waitMs, ctx.signal);
         continue;
@@ -349,6 +351,50 @@ function isAbortError(err: unknown): boolean {
 
 async function safeText(resp: Response): Promise<string> {
   try { return await resp.text(); } catch { return ''; }
+}
+
+/**
+ * Compute how long to sleep before retrying after a 429. X's rate-limit
+ * contract lives in two headers:
+ *   - `Retry-After`: seconds (RFC form) OR HTTP-date (rare).
+ *   - `x-rate-limit-reset`: epoch seconds when the current window resets.
+ *
+ * We take the MAX of both signals so we don't wake up into a still-closed
+ * window. Capped at 60s so a misbehaving header doesn't wedge the resolver
+ * for 15 minutes; the outer retry loop honors MAX_RETRIES_ON_429. Minimum
+ * 2s so we don't hot-spin on no headers.
+ *
+ * Exported for testability.
+ */
+export function computeBackoffMs(resp: Pick<Response, 'headers'>, now: number = Date.now()): number {
+  const MIN_MS = 2_000;
+  const MAX_MS = 60_000;
+
+  // Retry-After parsing: seconds or HTTP-date.
+  let retryAfterMs = 0;
+  const retryAfter = resp.headers.get('retry-after');
+  if (retryAfter) {
+    const asSeconds = parseInt(retryAfter, 10);
+    if (Number.isFinite(asSeconds) && asSeconds >= 0) {
+      retryAfterMs = asSeconds * 1000;
+    } else {
+      const asDate = Date.parse(retryAfter);
+      if (Number.isFinite(asDate)) retryAfterMs = Math.max(0, asDate - now);
+    }
+  }
+
+  // x-rate-limit-reset is an epoch second.
+  let rateResetMs = 0;
+  const rateReset = resp.headers.get('x-rate-limit-reset');
+  if (rateReset) {
+    const epochSec = parseInt(rateReset, 10);
+    if (Number.isFinite(epochSec) && epochSec > 0) {
+      rateResetMs = Math.max(0, epochSec * 1000 - now);
+    }
+  }
+
+  const waitMs = Math.max(MIN_MS, retryAfterMs, rateResetMs);
+  return Math.min(MAX_MS, waitMs);
 }
 
 function composeSignals(outer: AbortSignal | undefined, timeoutMs: number): AbortSignal {

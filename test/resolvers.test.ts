@@ -18,8 +18,8 @@ import type {
   ResolverRequest,
   ResolverResult,
 } from '../src/core/resolvers/index.ts';
-import { urlReachableResolver } from '../src/core/resolvers/builtin/url-reachable.ts';
-import { xHandleToTweetResolver } from '../src/core/resolvers/builtin/x-api/handle-to-tweet.ts';
+import { urlReachableResolver, checkDnsRebinding } from '../src/core/resolvers/builtin/url-reachable.ts';
+import { xHandleToTweetResolver, computeBackoffMs } from '../src/core/resolvers/builtin/x-api/handle-to-tweet.ts';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -316,6 +316,22 @@ describe('url_reachable resolver', () => {
     expect(r.confidence).toBe(1);
   });
 
+  test('checkDnsRebinding: skips IP literals', async () => {
+    expect(await checkDnsRebinding('http://8.8.8.8/')).toBeNull();
+    expect(await checkDnsRebinding('http://127.0.0.1/')).toBeNull();
+    expect(await checkDnsRebinding('http://[::1]/')).toBeNull();
+  });
+
+  test('checkDnsRebinding: returns null for unparseable URL', async () => {
+    expect(await checkDnsRebinding('not a url')).toBeNull();
+  });
+
+  test('checkDnsRebinding: returns null on DNS failure (surface via fetch)', async () => {
+    // Nonexistent TLD; DNS lookup fails, we let the fetch surface the error.
+    const r = await checkDnsRebinding('http://definitely-not-a-real-tld.invalidtld123/');
+    expect(r).toBeNull();
+  });
+
   test('AbortSignal fires mid-flight → ResolverError(aborted)', async () => {
     const ac = new AbortController();
     globalThis.fetch = (async () => {
@@ -353,6 +369,53 @@ describe('x_handle_to_tweet resolver', () => {
     globalThis.fetch = originalFetch;
     if (originalToken) process.env.X_API_BEARER_TOKEN = originalToken;
     else delete process.env.X_API_BEARER_TOKEN;
+  });
+
+  // ---- computeBackoffMs ----
+
+  test('computeBackoffMs: honors Retry-After seconds', () => {
+    const r = new Response('', { status: 429, headers: { 'retry-after': '10' } });
+    expect(computeBackoffMs(r)).toBe(10_000);
+  });
+
+  test('computeBackoffMs: honors Retry-After HTTP-date', () => {
+    const now = 1_700_000_000_000; // 2023-11-14T22:13:20Z
+    const future = new Date(now + 7_000).toUTCString();
+    const r = new Response('', { status: 429, headers: { 'retry-after': future } });
+    const ms = computeBackoffMs(r, now);
+    expect(ms).toBeGreaterThanOrEqual(6_000);
+    expect(ms).toBeLessThanOrEqual(8_000);
+  });
+
+  test('computeBackoffMs: honors x-rate-limit-reset epoch seconds', () => {
+    const now = 1_700_000_000_000;
+    const resetSec = Math.floor(now / 1000) + 15;
+    const r = new Response('', { status: 429, headers: { 'x-rate-limit-reset': String(resetSec) } });
+    expect(computeBackoffMs(r, now)).toBeGreaterThanOrEqual(14_000);
+    expect(computeBackoffMs(r, now)).toBeLessThanOrEqual(16_000);
+  });
+
+  test('computeBackoffMs: takes MAX when both headers present', () => {
+    const now = 1_700_000_000_000;
+    const resetSec = Math.floor(now / 1000) + 30;
+    const r = new Response('', {
+      status: 429,
+      headers: { 'retry-after': '5', 'x-rate-limit-reset': String(resetSec) },
+    });
+    const ms = computeBackoffMs(r, now);
+    expect(ms).toBeGreaterThanOrEqual(29_000);
+  });
+
+  test('computeBackoffMs: clamps to floor 2s when no headers', () => {
+    const r = new Response('', { status: 429 });
+    expect(computeBackoffMs(r)).toBeGreaterThanOrEqual(2_000);
+  });
+
+  test('computeBackoffMs: clamps to ceiling 60s', () => {
+    const now = 1_700_000_000_000;
+    const resetSec = Math.floor(now / 1000) + 600; // 10 min
+    const r = new Response('', { status: 429, headers: { 'x-rate-limit-reset': String(resetSec) } });
+    expect(computeBackoffMs(r, now)).toBeLessThanOrEqual(60_000);
   });
 
   test('available() false when token missing', async () => {
