@@ -320,9 +320,20 @@ async function runAutoLink(
   // Run getLinks + addLink/removeLink loops inside a single transaction so that
   // concurrent put_page calls on the same slug can't race the reconciliation:
   // without this, two simultaneous writes both read stale `existingKeys` and
-  // re-create links the other side just removed (lost-update). The transaction
-  // serializes via row-level locks on `links` rows touched by addLink/removeLink.
+  // re-create links the other side just removed (lost-update).
+  //
+  // Row-level locks alone aren't enough: both writers can read the same
+  // `existingKeys` set BEFORE either mutates a row, so the union-of-writes
+  // race survives. A transaction-scoped advisory lock keyed on the slug
+  // hash serializes the entire reconciliation across processes. Falls
+  // through on engines that don't support pg_advisory_xact_lock (PGLite is
+  // single-process so there's no cross-process concern there anyway).
   return await engine.transaction(async (tx) => {
+    try {
+      await tx.executeRaw(`SELECT pg_advisory_xact_lock(hashtext($1)::bigint)`, [`auto_link:${slug}`]);
+    } catch {
+      // engine doesn't support advisory locks — fall through
+    }
     const existing = await tx.getLinks(slug);
     const desiredKeys = new Set(valid.map(c => `${c.targetSlug}\u0000${c.linkType}`));
     const existingKeys = new Set(existing.map(l => `${l.to_slug}\u0000${l.link_type}`));
