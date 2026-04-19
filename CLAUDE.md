@@ -335,6 +335,54 @@ Source material to pull from:
 
 Target length: ~250-350 words for the summary. Should render as one viewport.
 
+### "To take advantage of v[version]" block (required, v0.13+)
+
+After the release-summary and BEFORE `### Itemized changes`, every `## [X.Y.Z]`
+entry MUST include a human-readable self-repair block under the heading
+`## To take advantage of v[version]`.
+
+Why: `gbrain upgrade` runs `gbrain post-upgrade` which runs `gbrain apply-migrations`.
+This chain has a known weak link — `upgrade.ts` catches post-upgrade failures as
+best-effort (so the binary still works). When that chain silently fails, users end
+up with half-upgraded brains. The self-repair block gives them a paste-ready
+recovery path; the v0.13+ `~/.gbrain/upgrade-errors.jsonl` trail + `gbrain doctor`
+integration close the loop.
+
+Template (adapt the verify commands per release):
+
+```markdown
+## To take advantage of v[version]
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor`
+warns about a partial migration:
+
+1. **Run the orchestrator manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **Your agent reads `skills/migrations/v[version].md` the next time you interact with it.**
+   [One sentence on whether headless agents need manual action, or whether the
+   orchestrator already handled the mechanical side.]
+3. **Verify the outcome:**
+   ```bash
+   [release-specific verify commands, e.g. `gbrain graph ... --depth 2`]
+   gbrain stats
+   ```
+4. **If any step fails or the numbers look wrong,** please file an issue:
+   https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor`
+   - contents of `~/.gbrain/upgrade-errors.jsonl` if it exists
+   - which step broke
+
+   This feedback loop is how Garry finds fragile upgrade paths. Thank you.
+```
+
+**Skip this block** for patches that are pure bug fixes with zero user-facing action
+(rare). If the release has a schema migration, data backfill, or new feature the
+user needs to verify, the block is required.
+
+The v0.13.0 entry in CHANGELOG.md is the canonical example.
+
 ### Itemized changes (the existing rules)
 
 Below the release summary, write `### Itemized changes` and continue with the
